@@ -37,6 +37,8 @@ function archivesOf(config: Config): Archives {
     const pullpush = new PullPushBackend(config.backends.pullpush.baseUrl);
     return {
         arcticComments: (subreddit, after) => arctic.listNewComments(subreddit, after),
+        arcticPosts: (subreddit, after, before) => arctic.listPosts(subreddit, after, before),
+        arcticThread: (postId) => arctic.listThreadComments(postId),
         arcticByIds: (ids) => arctic.fetchByIds(ids),
         arcticLabels: (ids) => arctic.removalLabels(ids),
         pullpushByIds: (ids) => pullpush.fetchByIds(ids)
@@ -67,7 +69,8 @@ async function pkcPublisher(pkc: PkcInstance, db: StateDb, nodeFiles: NodeFiles,
         subreddit: mirror.subreddit,
         botAddress: signer.address,
         sortsDir: nodeFiles.sortsDir,
-        sortDataFile: nodeFiles.sortDataFile
+        sortDataFile: nodeFiles.sortDataFile,
+        hotSort: mirror.hotSort
     });
     db.updateMirror(mirror.subreddit, { communityAddress: address });
     console.log(`[r/${mirror.subreddit}] mirroring into ${address} as ${signer.address}`);
@@ -78,7 +81,7 @@ async function pkcPublisher(pkc: PkcInstance, db: StateDb, nodeFiles: NodeFiles,
     };
 }
 
-function tasksOf(mirror: Mirror, db: StateDb, config: Config, nodeFiles: NodeFiles): Task[] {
+function tasksOf(mirror: Mirror, mirrorConfig: MirrorConfig, db: StateDb, config: Config, nodeFiles: NodeFiles): Task[] {
     const tasks: Task[] = [
         { name: "discover posts", everyMs: 2 * MINUTE, run: () => mirror.discoverPosts() },
         { name: "check threads", everyMs: MINUTE, run: () => mirror.checkDuePosts(30) },
@@ -103,6 +106,8 @@ function tasksOf(mirror: Mirror, db: StateDb, config: Config, nodeFiles: NodeFil
             }
         }
     ];
+    // A few archived threads per tick, between the live tasks; a no-op once the cursor reached backfillSince
+    if (mirrorConfig.backfillSince) tasks.push({ name: "backfill", everyMs: 0, run: () => mirror.backfill(5) });
     const address = db.mirror(mirror.subreddit).communityAddress;
     if (address && !DRY_RUN)
         tasks.push({
@@ -138,7 +143,7 @@ async function main() {
     for (const mirrorConfig of config.mirrors) {
         const publisher = pkc ? await pkcPublisher(pkc, db, nodeFiles, mirrorConfig) : dryRunPublisher(mirrorConfig.subreddit);
         const mirror = new Mirror(db, mirrorConfig, live, archives, publisher);
-        for (const task of tasksOf(mirror, db, config, nodeFiles))
+        for (const task of tasksOf(mirror, mirrorConfig, db, config, nodeFiles))
             scheduled.push({ label: `r/${mirrorConfig.subreddit} ${task.name}`, task, nextAt: 0 });
     }
 

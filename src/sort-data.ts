@@ -8,6 +8,8 @@ export interface SortDataEntry {
     createdUtc: number;
     status: string;
     removedBy: string | null;
+    // When the daemon first saw the item gone (or locked): the "most recently flaired first" order of sorts/flair-filter.js
+    flairedAt: number | null;
 }
 
 export const sortDataPath = (dataDir: string, communityAddress: string) => path.join(dataDir, "sort-data", `${communityAddress}.json`);
@@ -16,7 +18,13 @@ export const sortDataPath = (dataDir: string, communityAddress: string) => path.
 export async function writeSortData(db: StateDb, subreddit: string, file: string): Promise<number> {
     const data: Record<string, SortDataEntry> = {};
     for (const row of db.publishedForSortData(subreddit)) {
-        data[row.cid!] = { score: row.score, createdUtc: row.createdUtc, status: row.status, removedBy: row.removedBy };
+        data[row.cid!] = {
+            score: row.score,
+            createdUtc: row.createdUtc,
+            status: row.status,
+            removedBy: row.removedBy,
+            flairedAt: row.status === "up" || row.status === "missing" ? null : row.goneSeenAt
+        };
     }
     await fs.mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.tmp`;

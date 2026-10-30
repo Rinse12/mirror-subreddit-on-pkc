@@ -26,7 +26,16 @@ const MirrorSchema = z
         maxCommentsPerPost: z.number().int().positive().nullable().default(null),
         // Reddit accounts whose comments aren't mirrored (case-insensitive); replies to them go under the nearest
         // mirrored ancestor. Adding one later purges what was already published.
-        skipAuthors: z.array(z.string()).default(["AutoModerator"])
+        skipAuthors: z.array(z.string()).default(["AutoModerator"]),
+        // What the community serves as `hot`, the page Seedit opens on: Reddit's hot order, or only what Reddit removed
+        // (the `flaired` filter), with Reddit's hot order moving to `mirrored-reddit-hot`
+        hotSort: z.enum(["reddit-hot", "removed-only"]).default("reddit-hot"),
+        // Mirror the subreddit's history from Arctic Shift back to this instant (ISO 8601 with time and zone, e.g.
+        // "2026-01-01T00:00:00Z"); unset: no backfill
+        backfillSince: z.iso.datetime({ offset: true }).nullable().default(null),
+        // "all": every archived thread back to backfillSince; "removed": only threads where the post, or a comment
+        // whose text the archive kept, was removed
+        backfillOnly: z.enum(["all", "removed"]).default("all")
     })
     .strict();
 

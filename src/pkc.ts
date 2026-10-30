@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import PKC from "@pkcprotocol/pkc-js";
+import type { MirrorConfig } from "./config.js";
 
 export type PkcInstance = Awaited<ReturnType<typeof PKC>>;
 export type BotSigner = Awaited<ReturnType<PkcInstance["createSigner"]>>;
@@ -147,14 +148,35 @@ const sortEntry = (sortsDir: string, file: string, sortDataFile: string, preload
     preloaded
 });
 
-export function pageSettings(sortDataFile: string, sortsDir = SORTS_DIR) {
+export type HotSort = MirrorConfig["hotSort"];
+
+// The page sorts of a mirror community (see README, Scores). Post sorts take the built-in names Seedit requests (`hot`
+// preloaded, `new`, `active`), since a path file under a built-in name keeps the community's order on the client while a
+// name nobody asks for is never shown. With hotSort "removed-only" the flaired filter is what `hot` serves, and Reddit's
+// hot order moves to `mirrored-reddit-hot`. The reply sort keeps its own name: a reply file published as `best` would
+// be re-sorted by the client.
+export function pageSettings(sortDataFile: string, sortsDir = SORTS_DIR, hotSort: HotSort = "reddit-hot") {
+    const flairedOptions = { order: "flaired" };
     return {
         posts: [
-            sortEntry(sortsDir, "mirrored-reddit-hot.js", sortDataFile, true, { nativeWeight: "1" }),
-            sortEntry(sortsDir, "mirrored-reddit-new.js", sortDataFile, false),
-            sortEntry(sortsDir, "removed-first.js", sortDataFile, false, { nativeWeight: "1" })
+            ...(hotSort === "removed-only"
+                ? [
+                      sortEntry(sortsDir, "flaired-hot.js", sortDataFile, true, flairedOptions),
+                      sortEntry(sortsDir, "mirrored-reddit-hot.js", sortDataFile, false, { nativeWeight: "1" })
+                  ]
+                : [
+                      sortEntry(sortsDir, "hot.js", sortDataFile, true, { nativeWeight: "1" }),
+                      sortEntry(sortsDir, "flaired.js", sortDataFile, false, flairedOptions)
+                  ]),
+            sortEntry(sortsDir, "new.js", sortDataFile, false),
+            sortEntry(sortsDir, "removed-first.js", sortDataFile, false, { nativeWeight: "1" }),
+            // pkc-js's own active: bumps on native replies, so Seedit's "active" tab isn't empty
+            { name: "active" }
         ],
-        replies: [sortEntry(sortsDir, "mirrored-reddit-best.js", sortDataFile, true, { nativeWeight: "1" })]
+        replies: [
+            sortEntry(sortsDir, "mirrored-reddit-best.js", sortDataFile, true, { nativeWeight: "1" }),
+            sortEntry(sortsDir, "flaired-replies.js", sortDataFile, false, { nativeWeight: "1" })
+        ]
     };
 }
 
@@ -171,7 +193,8 @@ export function communityEdit(
     current: CommunityState,
     botAddress: string,
     sortDataFile: string,
-    sortsDir = SORTS_DIR
+    sortsDir = SORTS_DIR,
+    hotSort: HotSort = "reddit-hot"
 ): CommunityState | null {
     const roles = current.roles?.[botAddress] ? current.roles : { ...current.roles, [botAddress]: { role: "moderator" } };
     const challenges = (current.settings?.challenges ?? []).map((challenge) =>
@@ -179,7 +202,7 @@ export function communityEdit(
             ? challenge
             : { ...challenge, exclude: [...(challenge.exclude ?? []), { publicKeys: [botAddress] }] }
     );
-    const pages = pageSettings(sortDataFile, sortsDir);
+    const pages = pageSettings(sortDataFile, sortsDir, hotSort);
     const settings = { ...current.settings, challenges, pages };
     const changed =
         roles !== current.roles ||
@@ -198,7 +221,14 @@ async function hostedCommunities(pkc: PkcInstance): Promise<string[]> {
 // line, and starts it. Returns its address.
 export async function ensureCommunity(
     pkc: PkcInstance,
-    options: { address: string | null; subreddit: string; botAddress: string; sortsDir: string; sortDataFile: (address: string) => string }
+    options: {
+        address: string | null;
+        subreddit: string;
+        botAddress: string;
+        sortsDir: string;
+        sortDataFile: (address: string) => string;
+        hotSort: HotSort;
+    }
 ): Promise<string> {
     let community;
     if (options.address) {
@@ -227,7 +257,7 @@ export async function ensureCommunity(
     );
     // settings is replaced wholesale on edit: editing without having read it would wipe the challenges
     if (!local.settings) throw new Error(`${local.address} came back without its settings; is it hosted on this RPC node?`);
-    const edit = communityEdit(local, options.botAddress, options.sortDataFile(local.address), options.sortsDir);
+    const edit = communityEdit(local, options.botAddress, options.sortDataFile(local.address), options.sortsDir, options.hotSort);
     if (edit) {
         await local.edit(edit);
         console.log(`updated roles and settings of ${local.address}`);

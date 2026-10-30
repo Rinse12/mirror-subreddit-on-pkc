@@ -1,3 +1,7 @@
+import { mkdtempSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { type Item, StateDb } from "../src/db.js";
 import { nextCheckAt, recheckIntervalSeconds } from "../src/schedule.js";
@@ -31,6 +35,7 @@ const item = (overrides: Partial<Item> = {}): Item => ({
     publishStatus: "pending",
     publishError: null,
     publishedLabel: null,
+    origin: "live",
     ...overrides
 });
 
@@ -49,6 +54,32 @@ describe("StateDb", () => {
         expect(db.publishable("AskHistorians", 10).map((i) => i.redditId)).toEqual(["t3_1xfd707"]);
         db.update("AskHistorians", "t3_1xfd707", { publishStatus: "published", cid: "Qm1" });
         expect(db.publishable("AskHistorians", 10).map((i) => i.redditId)).toEqual(["t1_19ru7in2lzy9v"]);
+    });
+
+    it("publishes live items before backfilled ones, and history newest first", () => {
+        db = new StateDb(":memory:");
+        db.insert(item({ redditId: "t3_old", postId: "t3_old", createdUtc: 100, origin: "archive" }));
+        db.insert(item({ redditId: "t3_older", postId: "t3_older", createdUtc: 50, origin: "archive" }));
+        db.insert(item({ redditId: "t3_live", postId: "t3_live", createdUtc: 5000 }));
+        db.insert(item({ redditId: "t3_live_first", postId: "t3_live_first", createdUtc: 4000 }));
+        expect(db.publishable("AskHistorians", 10).map((i) => i.redditId)).toEqual(["t3_live_first", "t3_live", "t3_old", "t3_older"]);
+    });
+
+    it("adds the columns a database from before backfill lacks", () => {
+        const file = path.join(mkdtempSync(path.join(os.tmpdir(), "state-")), "state.sqlite");
+        const old = new Database(file);
+        old.exec(`CREATE TABLE items (subreddit TEXT NOT NULL, redditId TEXT NOT NULL, kind TEXT NOT NULL, postId TEXT NOT NULL, parentId TEXT,
+            author TEXT NOT NULL, createdUtc INTEGER NOT NULL, title TEXT, body TEXT, link TEXT, permalink TEXT NOT NULL, score INTEGER,
+            numComments INTEGER, status TEXT NOT NULL, removedBy TEXT, lastSeenUpAt INTEGER NOT NULL, goneSeenAt INTEGER, nextCheckAt INTEGER,
+            textLookups INTEGER NOT NULL DEFAULT 0, labelLookups INTEGER NOT NULL DEFAULT 0, labelCheckedAt INTEGER, cid TEXT UNIQUE,
+            publishStatus TEXT NOT NULL DEFAULT 'pending', publishError TEXT, publishedLabel TEXT, PRIMARY KEY (subreddit, redditId));
+            CREATE TABLE mirrors (subreddit TEXT PRIMARY KEY, communityAddress TEXT, authorFlairSet INTEGER NOT NULL DEFAULT 0, arcticCursor INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO items (subreddit, redditId, kind, postId, author, createdUtc, permalink, status, lastSeenUpAt)
+            VALUES ('AskHistorians', 't3_a', 'post', 't3_a', 'x', 1, '/r/a', 'up', 1);`);
+        old.close();
+        db = new StateDb(file);
+        expect(db.get("AskHistorians", "t3_a")).toMatchObject({ origin: "live" });
+        expect(db.mirror("AskHistorians").backfillCursor).toBeNull();
     });
 
     it("lists labels not yet shown, skipping unconfirmed missing items", () => {
@@ -78,7 +109,8 @@ describe("StateDb", () => {
             subreddit: "AskHistorians",
             communityAddress: null,
             authorFlairSet: 0,
-            arcticCursor: 0
+            arcticCursor: 0,
+            backfillCursor: null
         });
         db.updateMirror("AskHistorians", { communityAddress: "12D3KooW", arcticCursor: 5 });
         expect(db.mirror("AskHistorians")).toMatchObject({ communityAddress: "12D3KooW", arcticCursor: 5 });

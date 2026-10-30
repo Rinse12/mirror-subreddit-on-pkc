@@ -9,6 +9,13 @@
             "authorDeleted": "hide",
             "maxCommentsPerPost": null,
             "skipAuthors": ["AutoModerator"]
+        },
+        {
+            "subreddit": "AskHistorians",
+            "signerPath": "data/signers/askhistorians.json",
+            "hotSort": "removed-only",
+            "backfillSince": "2026-01-01T00:00:00Z",
+            "backfillOnly": "removed"
         }
     ],
     "backends": {

@@ -5,6 +5,11 @@ const BOT = "12D3KooWBot";
 const FILE = "/srv/mirror/data/sort-data/c.json";
 const question = { name: "question", options: { answer: "secret" } };
 
+type Entry = ReturnType<typeof pageSettings>["posts"][number];
+const isFile = (entry: Entry): entry is Exclude<Entry, { name: string }> => "path" in entry;
+const files = (entries: Entry[]) => entries.filter(isFile);
+const named = (entries: Entry[]) => entries.map((e) => (isFile(e) ? [e.path.split("/").pop(), e.preloaded] : [e.name, "built-in"]));
+
 describe("communityEdit", () => {
     it("makes the bot a moderator, exempts it from every challenge and sets the sorts", () => {
         const edit = communityEdit(
@@ -41,26 +46,50 @@ describe("communityEdit", () => {
 });
 
 describe("pageSettings", () => {
-    it("preloads mirrored-reddit-hot and keeps the data path private", () => {
+    it("serves Reddit's hot order as the preloaded `hot`, the built-in names Seedit asks for, and keeps the data path private", () => {
         const pages = pageSettings(FILE);
-        expect(pages.posts.map((p) => [p.path.split("/").pop(), p.preloaded])).toEqual([
-            ["mirrored-reddit-hot.js", true],
-            ["mirrored-reddit-new.js", false],
-            ["removed-first.js", false]
+        expect(named(pages.posts)).toEqual([
+            ["hot.js", true],
+            ["flaired.js", false],
+            ["new.js", false],
+            ["removed-first.js", false],
+            ["active", "built-in"]
         ]);
-        expect(pages.replies[0].path).toMatch(/sorts\/mirrored-reddit-best\.js$/);
-        expect(pages.posts.every((p) => p.privateOptions.includes("sortDataPath") && p.options.sortDataPath === FILE)).toBe(true);
+        expect(named(pages.replies)).toEqual([
+            ["mirrored-reddit-best.js", true],
+            ["flaired-replies.js", false]
+        ]);
+        expect(
+            files([...pages.posts, ...pages.replies]).every(
+                (p) => p.privateOptions.includes("sortDataPath") && p.options.sortDataPath === FILE
+            )
+        ).toBe(true);
+    });
+
+    it("with hotSort removed-only serves the flaired filter as `hot` and moves Reddit's hot order to its own name", () => {
+        const pages = pageSettings(FILE, undefined, "removed-only");
+        expect(named(pages.posts)).toEqual([
+            ["flaired-hot.js", true],
+            ["mirrored-reddit-hot.js", false],
+            ["new.js", false],
+            ["removed-first.js", false],
+            ["active", "built-in"]
+        ]);
+        expect(files(pages.posts)[0].options).toEqual({ sortDataPath: FILE, order: "flaired" });
+        expect(communityEdit({ settings: { challenges: [] } }, BOT, FILE, undefined, "removed-only")?.settings?.pages).toEqual(pages);
     });
 });
 
 describe("pageSettings on a remote node", () => {
     it("points every sort at the node's copy of the sort files", () => {
         const pages = pageSettings("/root/subreddit-mirror/sort-data/c.json", "/root/subreddit-mirror/sorts");
-        expect([...pages.posts, ...pages.replies].map((p) => p.path)).toEqual([
-            "/root/subreddit-mirror/sorts/mirrored-reddit-hot.js",
-            "/root/subreddit-mirror/sorts/mirrored-reddit-new.js",
+        expect(files([...pages.posts, ...pages.replies]).map((p) => p.path)).toEqual([
+            "/root/subreddit-mirror/sorts/hot.js",
+            "/root/subreddit-mirror/sorts/flaired.js",
+            "/root/subreddit-mirror/sorts/new.js",
             "/root/subreddit-mirror/sorts/removed-first.js",
-            "/root/subreddit-mirror/sorts/mirrored-reddit-best.js"
+            "/root/subreddit-mirror/sorts/mirrored-reddit-best.js",
+            "/root/subreddit-mirror/sorts/flaired-replies.js"
         ]);
     });
 });

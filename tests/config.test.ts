@@ -8,7 +8,14 @@ const mirror = { subreddit: "AskHistorians", communityAddress: "ah.bso", signerP
 describe("parseConfig", () => {
     it("accepts config.example.json", () => {
         const raw = JSON.parse(readFileSync(path.join(import.meta.dirname, "../config.example.json"), "utf8"));
-        expect(parseConfig(raw, "/srv/mirror").mirrors[0].signerPath).toBe("/srv/mirror/data/signers/askscience.json");
+        const config = parseConfig(raw, "/srv/mirror");
+        expect(config.mirrors[0].signerPath).toBe("/srv/mirror/data/signers/askscience.json");
+        expect(config.mirrors[1]).toMatchObject({
+            subreddit: "AskHistorians",
+            hotSort: "removed-only",
+            backfillOnly: "removed",
+            backfillSince: "2026-01-01T00:00:00Z"
+        });
     });
 
     it("fills in defaults", () => {
@@ -20,7 +27,10 @@ describe("parseConfig", () => {
             commentUpdateDays: 7,
             minScore: 0,
             authorDeleted: "hide",
-            maxCommentsPerPost: null
+            maxCommentsPerPost: null,
+            hotSort: "reddit-hot",
+            backfillSince: null,
+            backfillOnly: "all"
         });
         expect(config.backends.redlib.instances).toEqual([]);
         expect(config.backends["arctic-shift"].baseUrl).toBe("https://arctic-shift.photon-reddit.com");
@@ -48,6 +58,14 @@ describe("parseConfig", () => {
     it("requires nodeDir with rpcSshHost", () => {
         expect(() => parseConfig({ rpcSshHost: "my-node", mirrors: [mirror] })).toThrow(/nodeDir: required with rpcSshHost/);
         expect(parseConfig({ rpcSshHost: "my-node", nodeDir: "/root/subreddit-mirror", mirrors: [mirror] }).rpcPort).toBe(9138);
+    });
+
+    it("takes backfillSince as an ISO datetime with a zone, not a bare date", () => {
+        expect(parseConfig({ mirrors: [{ ...mirror, backfillSince: "2026-01-01T00:00:00+01:00" }] }).mirrors[0].backfillSince).toBe(
+            "2026-01-01T00:00:00+01:00"
+        );
+        expect(() => parseConfig({ mirrors: [{ ...mirror, backfillSince: "2026-01-01" }] })).toThrow(/mirrors\.0\.backfillSince/);
+        expect(() => parseConfig({ mirrors: [{ ...mirror, hotSort: "flaired" }] })).toThrow(/mirrors\.0\.hotSort/);
     });
 
     it("rejects unknown keys", () => {

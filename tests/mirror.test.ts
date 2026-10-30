@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import type { Archived } from "../src/backends/arctic-shift.js";
 import type { LiveSource } from "../src/backends/live.js";
 import { SourcePool } from "../src/backends/source-pool.js";
 import { parseConfig } from "../src/config.js";
@@ -91,6 +92,8 @@ class FakePublisher implements Publisher {
 
 const archives = (o: Partial<Archives> = {}): Archives => ({
     arcticComments: async () => [],
+    arcticPosts: async () => [],
+    arcticThread: async () => [],
     arcticByIds: async () => [],
     arcticLabels: async () => new Map(),
     pullpushByIds: async () => [],
@@ -381,5 +384,151 @@ describe("Mirror", () => {
         const m = mirror();
         await mirrorThread(m, []);
         expect(db.get(SUB, POST)!.nextCheckAt).toBe(now + 600);
+    });
+
+    describe("backfill", () => {
+        const DAY = 86400;
+        const SINCE = "2026-10-01T00:00:00Z";
+        const sinceUtc = Date.parse(SINCE) / 1000;
+        // An archived item: read once shortly after posting, once more ~36 h later
+        const archived = (o: Observed, extra: Partial<Archived> = {}): Archived => ({
+            ...o,
+            retrievedOn: o.createdUtc + 300,
+            recheckedOn: o.createdUtc + 36 * 3600,
+            ...extra
+        });
+        const newer = archived(
+            post({ redditId: "t3_newer", postId: "t3_newer", createdUtc: T0 - 10 * DAY, permalink: "/r/AskHistorians/comments/newer/" })
+        );
+        const older = archived(
+            post({ redditId: "t3_older", postId: "t3_older", createdUtc: T0 - 20 * DAY, permalink: "/r/AskHistorians/comments/older/" })
+        );
+        const threads: Record<string, Archived[]> = {
+            t3_newer: [
+                archived(
+                    comment("t1_kept", "t3_newer", {
+                        postId: "t3_newer",
+                        createdUtc: T0 - 10 * DAY + 60,
+                        status: "removed",
+                        removedBy: "removed"
+                    })
+                ),
+                archived(
+                    comment("t1_lost", "t3_newer", {
+                        postId: "t3_newer",
+                        createdUtc: T0 - 10 * DAY + 120,
+                        body: null,
+                        status: "removed",
+                        removedBy: "removed"
+                    })
+                ),
+                archived(comment("t1_reply_to_lost", "t1_lost", { postId: "t3_newer", createdUtc: T0 - 10 * DAY + 180 })),
+                archived(comment("t1_up", "t3_newer", { postId: "t3_newer", createdUtc: T0 - 10 * DAY + 240 }))
+            ],
+            t3_older: [archived(comment("t1_old_up", "t3_older", { postId: "t3_older", createdUtc: T0 - 20 * DAY + 60 }))]
+        };
+        const archive = (posts = [newer, older]) =>
+            archives({
+                arcticPosts: async (_sub, after, before) => posts.filter((p) => p.createdUtc > after && p.createdUtc < before),
+                arcticThread: async (postId) => threads[postId] ?? []
+            });
+
+        it("mirrors archived threads newest first, with the archive's reads as the removal window, and skips text it lost", async () => {
+            const m = mirror(archive(), { backfillSince: SINCE });
+            now = T0;
+            expect(await m.backfill(1)).toBe(1);
+            expect(db.get(SUB, "t3_newer")).toMatchObject({ origin: "archive", nextCheckAt: null, lastSeenUpAt: newer.recheckedOn });
+            expect(db.get(SUB, "t3_older")).toBeUndefined();
+            expect(db.get(SUB, "t1_kept")).toMatchObject({
+                status: "removed",
+                removedBy: "removed",
+                lastSeenUpAt: T0 - 10 * DAY + 60 + 300,
+                goneSeenAt: T0 - 10 * DAY + 60 + 36 * 3600,
+                publishStatus: "pending"
+            });
+            expect(db.get(SUB, "t1_lost")).toMatchObject({ publishStatus: "skipped", body: null });
+            expect(db.mirror(SUB).backfillCursor).toBe(newer.createdUtc);
+
+            await m.publishPending(50);
+            await m.publishLabels(50);
+            const comments = publisher
+                .of("comment")
+                .map((c) => c[1] as { content: string; parentCid?: string; author: { displayName: string } });
+            expect(comments[0].content).toBe("Question text\n\n---\n\n*Mirrored from the Arctic Shift archive.*");
+            // The reply to the lost comment hangs under the post, like a reply to a skipped author
+            expect(comments.find((c) => c.author.displayName === "u/author_t1_reply_to_lost")!.parentCid).toBe("Qm1");
+            expect(publisher.of("moderate").at(-1)![2]).toEqual({ flairs: [{ text: "Removed on Reddit" }] });
+            expect(publisher.of("edit")[0][2]).toMatch(
+                /^text of t1_kept\n\n---\n\n\*Mirrored from the Arctic Shift archive\. Removed on Reddit between 2026-10-19 12:06 and 2026-10-21 00:01 UTC, 5 min to 1 d 12 h after posting\. Last seen with score 3\.\*$/
+            );
+
+            // The next call takes the next post; the page after that is empty, so the backfill is done
+            expect(await m.backfill(5)).toBe(1);
+            expect(db.get(SUB, "t3_older")).toMatchObject({ origin: "archive" });
+            expect(await m.backfill(5)).toBe(0);
+            expect(db.mirror(SUB).backfillCursor).toBe(sinceUtc);
+            expect(await m.backfill(5)).toBe(0);
+        });
+
+        it("with backfillOnly removed takes only threads where something with text was removed, and leaves live threads alone", async () => {
+            const m = mirror(archive(), { backfillSince: SINCE, backfillOnly: "removed" });
+            now = T0;
+            await m.backfill(5);
+            expect(db.get(SUB, "t3_newer")).toBeDefined();
+            expect(db.get(SUB, "t3_older")).toBeUndefined();
+
+            db.close();
+            db = new StateDb(":memory:");
+            source.posts = [post({ redditId: "t3_newer", postId: "t3_newer", createdUtc: T0 - 10 * DAY })];
+            source.thread = { post: source.posts[0], comments: [] };
+            const live = mirror(archive(), { backfillSince: SINCE });
+            await live.discoverPosts();
+            await live.backfill(5);
+            expect(db.get(SUB, "t3_newer")).toMatchObject({ origin: "live" });
+            expect(db.get(SUB, "t1_kept")).toBeUndefined();
+        });
+
+        it("hands a thread the archive hasn't re-read yet to the live checks, and respects minScore", async () => {
+            const fresh = archived(post({ redditId: "t3_fresh", postId: "t3_fresh", createdUtc: T0 - 3600, score: 1 }), {
+                recheckedOn: null
+            });
+            const m = mirror(archive([fresh]), { backfillSince: SINCE });
+            now = T0;
+            await m.backfill(5);
+            expect(db.get(SUB, "t3_fresh")).toMatchObject({ origin: "archive", nextCheckAt: T0, lastSeenUpAt: fresh.retrievedOn });
+
+            db.close();
+            db = new StateDb(":memory:");
+            await mirror(archive([fresh]), { backfillSince: SINCE, minScore: 5 }).backfill(5);
+            expect(db.get(SUB, "t3_fresh")).toBeUndefined();
+        });
+
+        it("retries a thread whose fetch failed on the next call, without losing the rest of the page", async () => {
+            let fail = true;
+            const flaky = archives({
+                arcticPosts: async (_sub, after, before) => [newer, older].filter((p) => p.createdUtc > after && p.createdUtc < before),
+                arcticThread: async (postId) => {
+                    if (fail && postId === "t3_newer") {
+                        fail = false;
+                        throw new Error("Arctic Shift: HTTP 503");
+                    }
+                    return threads[postId] ?? [];
+                }
+            });
+            const m = mirror(flaky, { backfillSince: SINCE });
+            now = T0;
+            await expect(m.backfill(5)).rejects.toThrow(/503/);
+            expect(db.get(SUB, "t3_newer")).toBeUndefined();
+            expect(await m.backfill(5)).toBe(2);
+            expect(db.get(SUB, "t3_newer")).toBeDefined();
+            expect(db.get(SUB, "t3_older")).toBeDefined();
+        });
+
+        it("does nothing without backfillSince", async () => {
+            let asked = 0;
+            const m = mirror(archives({ arcticPosts: async () => (asked++, []) }));
+            expect(await m.backfill(5)).toBe(0);
+            expect(asked).toBe(0);
+        });
     });
 });

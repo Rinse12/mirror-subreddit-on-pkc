@@ -1,5 +1,5 @@
 // Posts removed on Reddit first, each group in mirrored-reddit-hot order
-import { hotScore } from "./mirrored-reddit-hot.js";
+import { hotScore } from "./reddit-hot.js";
 import { entryOf, optionInputs, SORT_DATA_PATH_OPTION, sortData, validatePageSortSettings } from "./sort-data.js";
 
 // Larger than any hot score (the time term is ~15k in 2026)

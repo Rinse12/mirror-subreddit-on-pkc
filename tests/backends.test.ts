@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ArcticShiftBackend } from "../src/backends/arctic-shift.js";
+import { ArcticShiftBackend, parseArchived } from "../src/backends/arctic-shift.js";
 import { PullPushBackend } from "../src/backends/pullpush.js";
 import { FetchError, fetchJson, HostThrottle } from "../src/backends/http.js";
 import { RedditJsonBackend } from "../src/backends/reddit-json.js";
@@ -184,6 +184,72 @@ describe("ArcticShiftBackend", () => {
     it("surfaces its error message", async () => {
         vi.stubGlobal("fetch", async () => respond({ data: null, error: "'limit' must be between 1 and 100" }));
         await expect(new ArcticShiftBackend("https://as", new HostThrottle(0)).listNewComments("x", 0)).rejects.toThrow(/'limit' must be/);
+    });
+});
+
+describe("parseArchived", () => {
+    it("takes the fate of an item from the archive's re-check, keeping the text its first read saved", () => {
+        const removedLater = parseArchived("t1", {
+            ...comment().data,
+            retrieved_on: 1793296200,
+            _meta: { removal_type: "removed", retrieved_2nd_on: 1793425800, was_deleted_later: true }
+        });
+        expect(removedLater).toMatchObject({
+            status: "removed",
+            removedBy: "removed",
+            body: "An answer",
+            retrievedOn: 1793296200,
+            recheckedOn: 1793425800
+        });
+        expect(parseArchived("t1", { ...comment().data, _meta: { removal_type: "deleted", retrieved_2nd_on: 1 } })).toMatchObject({
+            status: "deleted",
+            removedBy: "deleted"
+        });
+        expect(parseArchived("t3", { ...post().data, _meta: { removal_type: "reddit", retrieved_2nd_on: 1 } })).toMatchObject({
+            status: "removed",
+            removedBy: "reddit"
+        });
+        // Already gone at the first read: the text is lost, and nothing says when
+        expect(parseArchived("t1", { ...comment().data, body: "[removed]", retrieved_on: 5, _meta: null })).toMatchObject({
+            status: "removed",
+            body: null,
+            retrievedOn: 5,
+            recheckedOn: null
+        });
+        // Reddit's own category on a post wins over the archive's coarser label
+        expect(parseArchived("t3", { ...post().data, removed_by_category: "moderator", _meta: { removal_type: "removed" } })).toMatchObject(
+            { removedBy: "moderator" }
+        );
+        expect(parseArchived("t1", { ...comment().data, _meta: { retrieved_2nd_on: 1 } })).toMatchObject({
+            status: "up",
+            removedBy: null,
+            recheckedOn: 1
+        });
+    });
+});
+
+describe("ArcticShiftBackend backfill", () => {
+    it("lists archived posts newest first between two instants, and a thread's comments across pages", async () => {
+        const urls: string[] = [];
+        vi.stubGlobal("fetch", async (url: string) => {
+            urls.push(url);
+            if (url.includes("/posts/")) return respond({ data: [post().data] });
+            // A full first page, then the rest
+            const page = !url.includes("after=")
+                ? Array.from({ length: 100 }, (_, i) => ({ ...comment().data, id: `c${i}`, name: `t1_c${i}`, created_utc: 1793296100 + i }))
+                : [comment({ id: "last", name: "t1_last", created_utc: 1793296300 }).data];
+            return respond({ data: page });
+        });
+        const backend = new ArcticShiftBackend("https://as", new HostThrottle(0));
+        expect((await backend.listPosts("AskHistorians", 1767225600, 1793296045)).map((p) => p.redditId)).toEqual(["t3_1xiqxin"]);
+        const thread = await backend.listThreadComments("t3_1xiqxin");
+        expect(thread).toHaveLength(101);
+        expect(thread.at(-1)!.redditId).toBe("t1_last");
+        expect(urls).toEqual([
+            "https://as/api/posts/search?subreddit=AskHistorians&after=1767225600&before=1793296045&sort=desc&limit=100",
+            "https://as/api/comments/search?link_id=t3_1xiqxin&sort=asc&limit=100",
+            "https://as/api/comments/search?link_id=t3_1xiqxin&after=1793296199&sort=asc&limit=100"
+        ]);
     });
 });
 

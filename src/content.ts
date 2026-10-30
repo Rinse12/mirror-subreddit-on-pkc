@@ -58,17 +58,27 @@ export function statusFlair(item: Pick<Item, "status" | "removedBy" | "kind">): 
     return { text: phrase === "Removed by moderators on Reddit" ? "Removed by mods on Reddit" : phrase };
 }
 
-// The line the bot appends to a removed item: who, the time window, how long after posting, the last numbers seen
+export const ARCHIVE_NOTE = "Mirrored from the Arctic Shift archive";
+
+// The line the bot appends to an item it backfilled from the archive and didn't see removed
+export const archiveNote = () => `\n\n---\n\n*${ARCHIVE_NOTE}.*`;
+
+// The line the bot appends to a removed item: who, the time window, how long after posting, the last numbers seen.
+// For a backfilled item the window is the archive's two reads, about 36 h apart, and the line says where it came from.
 export function removalNote(
-    item: Pick<Item, "status" | "removedBy" | "kind" | "createdUtc" | "lastSeenUpAt" | "goneSeenAt" | "score" | "numComments">
+    item: Pick<Item, "status" | "removedBy" | "kind" | "createdUtc" | "lastSeenUpAt" | "goneSeenAt" | "score" | "numComments" | "origin">
 ): string {
-    const parts = [removerPhrase(item)];
+    const parts = [item.origin === "archive" ? `${ARCHIVE_NOTE}. ${removerPhrase(item)}` : removerPhrase(item)];
     if (item.goneSeenAt) {
         const sameDay = utcDate(item.lastSeenUpAt) === utcDate(item.goneSeenAt);
         const from = `${utcDate(item.lastSeenUpAt)} ${utcTime(item.lastSeenUpAt)}`;
         const to = sameDay ? utcTime(item.goneSeenAt) : `${utcDate(item.goneSeenAt)} ${utcTime(item.goneSeenAt)}`;
         parts[0] += ` between ${from} and ${to} UTC`;
-        parts[0] += `, ${formatDuration(item.lastSeenUpAt - item.createdUtc)} to ${formatDuration(item.goneSeenAt - item.createdUtc)} after posting`;
+        // Never seen up (already gone at the first sighting): all we know is that it was up when it was made
+        parts[0] +=
+            item.lastSeenUpAt <= item.createdUtc
+                ? `, within ${formatDuration(Math.max(item.goneSeenAt - item.createdUtc, 60))} of posting`
+                : `, ${formatDuration(item.lastSeenUpAt - item.createdUtc)} to ${formatDuration(item.goneSeenAt - item.createdUtc)} after posting`;
     }
     const numbers = [
         item.score !== null ? `score ${item.score}` : null,

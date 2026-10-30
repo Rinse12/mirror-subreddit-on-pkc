@@ -1,5 +1,6 @@
 // Shared by the page sort files. The mirror daemon writes data/sort-data/<communityAddress>.json,
-// { "<cid>": { "score": number|null, "createdUtc": number, "status": "up"|"removed"|..., "removedBy": string|null } },
+// { "<cid>": { "score": number|null, "createdUtc": number, "status": "up"|"removed"|..., "removedBy": string|null,
+//   "flairedAt": number|null } } (flairedAt: when the daemon first saw the item gone, for the flaired order),
 // and each sort keeps it in memory, re-read every 60 s outside score(): score() is sync and gets no database.
 // Plain JS because the community node import()s these files directly.
 import { readFileSync, promises as fs } from "node:fs";
@@ -18,6 +19,8 @@ function parse(text) {
 // The map for one file, shared by every sort that reads it. Loaded synchronously the first time (when the factory
 // runs, never inside score), then refreshed in the background. A missing or broken file leaves the last good map.
 export function sortData(path) {
+    // A sort without data (the flair filter on a community that isn't a mirror) scores from the entries alone
+    if (!path) return { map: new Map() };
     let cache = caches.get(path);
     if (!cache) {
         cache = { map: new Map() };
@@ -36,7 +39,11 @@ export function sortData(path) {
 }
 
 export const optionInputs = [
-    { option: SORT_DATA_PATH_OPTION, label: "Sort data file", description: "Path of the JSON file the mirror daemon writes for this community" },
+    {
+        option: SORT_DATA_PATH_OPTION,
+        label: "Sort data file",
+        description: "Path of the JSON file the mirror daemon writes for this community"
+    },
     {
         option: NATIVE_WEIGHT_OPTION,
         label: "Native vote weight",
@@ -48,7 +55,8 @@ export const optionInputs = [
 export function validatePageSortSettings({ pageSortSettings }) {
     if (!pageSortSettings.options?.[SORT_DATA_PATH_OPTION]) throw new Error(`${SORT_DATA_PATH_OPTION} must be set`);
     const weight = pageSortSettings.options?.[NATIVE_WEIGHT_OPTION];
-    if (weight !== undefined && !Number.isFinite(Number(weight))) throw new Error(`${NATIVE_WEIGHT_OPTION} must be a number, got "${weight}"`);
+    if (weight !== undefined && !Number.isFinite(Number(weight)))
+        throw new Error(`${NATIVE_WEIGHT_OPTION} must be a number, got "${weight}"`);
 }
 
 export const nativeWeightOf = (options) => {

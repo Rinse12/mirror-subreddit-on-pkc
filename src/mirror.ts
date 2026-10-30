@@ -1,7 +1,17 @@
+import type { Archived } from "./backends/arctic-shift.js";
 import type { LiveSource } from "./backends/live.js";
 import type { SourcePool } from "./backends/source-pool.js";
 import type { MirrorConfig } from "./config.js";
-import { authorDeletedContent, MIRROR_AUTHOR_FLAIR, mirroredAuthor, mirroredContent, mirroredTitle, removalNote, statusFlair } from "./content.js";
+import {
+    archiveNote,
+    authorDeletedContent,
+    MIRROR_AUTHOR_FLAIR,
+    mirroredAuthor,
+    mirroredContent,
+    mirroredTitle,
+    removalNote,
+    statusFlair
+} from "./content.js";
 import { type Item, labelOf, type StateDb } from "./db.js";
 import type { Moderation, NewComment } from "./pkc.js";
 import { PublishRejected } from "./pkc.js";
@@ -21,6 +31,10 @@ const OVER_CAP = "over maxCommentsPerPost";
 
 export interface Archives {
     arcticComments(subreddit: string, after: number): Promise<Observed[]>;
+    // Archived posts made strictly between after and before, newest first, one page
+    arcticPosts(subreddit: string, after: number, before: number): Promise<Archived[]>;
+    // Every archived comment of a thread
+    arcticThread(postId: string): Promise<Archived[]>;
     arcticByIds(ids: string[]): Promise<Observed[]>;
     arcticLabels(commentIds: string[]): Promise<Map<string, "removed" | "deleted">>;
     pullpushByIds(ids: string[]): Promise<Observed[]>;
@@ -39,8 +53,14 @@ const precision = (removedBy: string | null) =>
 
 const isGone = (status: Item["status"]) => status === "removed" || status === "deleted";
 
+// What makes an archived thread worth backfilling with backfillOnly "removed": a removed post (its title is always
+// kept), or a removed comment whose text the archive kept
+const removedWithText = (item: Archived) => item.status === "removed" && (item.kind === "post" || item.body !== null);
+
 export class Mirror {
     readonly subreddit: string;
+    // The page of archived posts the backfill is working through, newest first
+    private backfillPage: Archived[] = [];
 
     constructor(
         private readonly db: StateDb,
@@ -73,7 +93,28 @@ export class Mirror {
             cid: null,
             publishStatus: observed.kind === "comment" && this.skips(observed.author) ? "skipped" : "pending",
             publishError: null,
-            publishedLabel: null
+            publishedLabel: null,
+            origin: "live"
+        };
+    }
+
+    // An item from the archive. Its removal window is the archive's two reads: up at the first (when the text was
+    // kept), gone at the re-check. A removed comment whose text the archive lost is recorded but never published.
+    private archivedItem(archived: Archived, now: number): Item {
+        const gone = isGone(archived.status);
+        const item = this.newItem(archived, now);
+        const textless = archived.kind === "comment" && gone && archived.body === null;
+        return {
+            ...item,
+            origin: "archive",
+            lastSeenUpAt: gone
+                ? archived.body !== null && archived.retrievedOn
+                    ? archived.retrievedOn
+                    : archived.createdUtc
+                : (archived.recheckedOn ?? archived.retrievedOn ?? archived.createdUtc),
+            goneSeenAt: gone ? (archived.recheckedOn ?? archived.retrievedOn ?? now) : null,
+            nextCheckAt: null,
+            publishStatus: textless ? "skipped" : item.publishStatus
         };
     }
 
@@ -157,7 +198,9 @@ export class Mirror {
                 nextCheckAt: nextCheckAt(post.createdUtc, now, this.config.commentUpdateDays)
             });
         });
-        const vanished = this.db.commentsOf(this.subreddit, post.redditId).filter((c) => !seen.has(c.redditId) && !isGone(c.status) && c.publishStatus !== "skipped");
+        const vanished = this.db
+            .commentsOf(this.subreddit, post.redditId)
+            .filter((c) => !seen.has(c.redditId) && !isGone(c.status) && c.publishStatus !== "skipped");
         for (const comment of vanished) {
             if (comment.status !== "missing") this.db.update(this.subreddit, comment.redditId, { status: "missing", goneSeenAt: now });
             const current = await this.live.run((source) => source.checkComment(comment.permalink, comment.redditId));
@@ -191,6 +234,73 @@ export class Mirror {
             const parent = parents.get(c.redditId);
             c.parentId = parent && this.db.get(this.subreddit, parent) ? parent : c.postId;
         }
+    }
+
+    private backfillSince(): number | null {
+        return this.config.backfillSince ? Math.floor(Date.parse(this.config.backfillSince) / 1000) : null;
+    }
+
+    // Mirrors the subreddit's history from Arctic Shift, newest post first, back to backfillSince, a few posts per call so
+    // the live tasks keep running in between. Threads the live path knows are left alone. Returns how many archived
+    // posts were looked at; 0 once the backfill is done.
+    async backfill(maxPosts = 5): Promise<number> {
+        const since = this.backfillSince();
+        if (since === null) return 0;
+        let cursor = this.db.mirror(this.subreddit).backfillCursor ?? this.now();
+        if (cursor <= since) return 0;
+        if (!this.backfillPage.length) {
+            this.backfillPage = await this.archives.arcticPosts(this.subreddit, since, cursor);
+            if (!this.backfillPage.length) {
+                this.db.updateMirror(this.subreddit, { backfillCursor: since });
+                this.log(`backfill from the archive done, back to ${new Date(since * 1000).toISOString()}`);
+                return 0;
+            }
+        }
+        let looked = 0;
+        let added = 0;
+        try {
+            // A post leaves the page only once it is dealt with: a failed thread fetch is retried on the next call
+            while (looked < maxPosts && this.backfillPage.length) {
+                const post = this.backfillPage[0];
+                const wanted = !this.db.get(this.subreddit, post.redditId) && !(post.score !== null && post.score < this.config.minScore);
+                if (wanted) {
+                    const comments = await this.archives.arcticThread(post.redditId);
+                    if (this.config.backfillOnly !== "removed" || removedWithText(post) || comments.some(removedWithText)) {
+                        this.recordArchivedThread(post, comments);
+                        added++;
+                    }
+                }
+                this.backfillPage.shift();
+                // Both search bounds are exclusive: the next page starts right below this post
+                cursor = post.createdUtc;
+                looked++;
+            }
+        } finally {
+            this.db.updateMirror(this.subreddit, { backfillCursor: cursor });
+        }
+        if (added) this.log(`backfilled ${added} threads from the archive, now at ${new Date(cursor * 1000).toISOString()}`);
+        return looked;
+    }
+
+    private recordArchivedThread(post: Archived, comments: Archived[]): void {
+        const now = this.now();
+        this.db.transaction(() => {
+            // The archive hasn't re-read every item yet (it does so ~36 h after posting): the live checks take over
+            const unchecked = [post, ...comments].some((item) => item.recheckedOn === null);
+            this.db.insert({
+                ...this.archivedItem(post, now),
+                nextCheckAt: unchecked ? now : nextCheckAt(post.createdUtc, now, this.config.commentUpdateDays)
+            });
+            // Parents are older than their replies, so in time order a parent is always known before its replies; one the
+            // archive never saved leaves its replies hanging under the post, as the live path does
+            const known = new Set([post.redditId]);
+            for (const comment of [...comments].sort((a, b) => a.createdUtc - b.createdUtc)) {
+                if (known.has(comment.redditId)) continue;
+                const parentId = comment.parentId && known.has(comment.parentId) ? comment.parentId : comment.postId;
+                known.add(comment.redditId);
+                this.db.insert(this.archivedItem({ ...comment, parentId }, now));
+            }
+        });
     }
 
     // Arctic Shift's comment search, as a second feed for comments of posts we mirror
@@ -275,7 +385,8 @@ export class Mirror {
     }
 
     contentFor(item: Item): string {
-        if (item.status === "up" || item.status === "missing") return mirroredContent(item);
+        if (item.status === "up" || item.status === "missing")
+            return mirroredContent(item) + (item.origin === "archive" ? archiveNote() : "");
         const base = item.status === "deleted" && this.config.authorDeleted === "hide" ? authorDeletedContent() : mirroredContent(item);
         return base + removalNote(item);
     }
@@ -354,7 +465,12 @@ export class Mirror {
                 purged++;
             }
             this.db.transaction(() => {
-                this.db.update(this.subreddit, item.redditId, { publishStatus: "skipped", cid: null, publishedLabel: null, publishError: null });
+                this.db.update(this.subreddit, item.redditId, {
+                    publishStatus: "skipped",
+                    cid: null,
+                    publishedLabel: null,
+                    publishError: null
+                });
                 if (item.cid)
                     for (const reply of this.db.replyTree(this.subreddit, item.redditId))
                         if (reply.publishStatus === "published")

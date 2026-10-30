@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatDuration, mirroredAuthor, mirroredContent, removalNote, statusFlair } from "../src/content.js";
+import { archiveNote, formatDuration, mirroredAuthor, mirroredContent, removalNote, statusFlair } from "../src/content.js";
 
 const T = Date.UTC(2026, 9, 29, 11, 0, 0) / 1000;
 const item = {
@@ -13,7 +13,8 @@ const item = {
     lastSeenUpAt: T + 3 * 3600,
     goneSeenAt: T + 3 * 3600 + 600,
     score: 12 as number | null,
-    numComments: 34 as number | null
+    numComments: 34 as number | null,
+    origin: "live" as const
 };
 
 describe("content", () => {
@@ -26,6 +27,22 @@ describe("content", () => {
     it("writes the removal window, the time since posting and the last numbers", () => {
         expect(removalNote(item)).toBe(
             "\n\n---\n\n*Removed by moderators on Reddit between 2026-10-29 14:00 and 14:10 UTC, 3 h to 3 h 10 min after posting. Last seen with score 12, 34 comments.*"
+        );
+    });
+
+    it("says where a backfilled item came from, with the archive's two reads as its window", () => {
+        expect(removalNote({ ...item, origin: "archive", lastSeenUpAt: T + 600, goneSeenAt: T + 36 * 3600 + 600 })).toBe(
+            "\n\n---\n\n*Mirrored from the Arctic Shift archive. Removed by moderators on Reddit between 2026-10-29 11:10 and 2026-10-30 23:10 UTC, 10 min to 1 d 12 h after posting. Last seen with score 12, 34 comments.*"
+        );
+        expect(archiveNote()).toBe("\n\n---\n\n*Mirrored from the Arctic Shift archive.*");
+    });
+
+    it("says 'within' when the item was already gone at the first sighting", () => {
+        expect(removalNote({ ...item, lastSeenUpAt: T, goneSeenAt: T + 20, numComments: null, score: null })).toBe(
+            "\n\n---\n\n*Removed by moderators on Reddit between 2026-10-29 11:00 and 11:00 UTC, within 1 min of posting.*"
+        );
+        expect(removalNote({ ...item, lastSeenUpAt: T, goneSeenAt: T + 7200, numComments: null, score: null })).toMatch(
+            /within 2 h of posting/
         );
     });
 

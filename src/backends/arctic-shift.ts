@@ -3,6 +3,32 @@ import { type Observed, parseThing } from "../reddit.js";
 
 // /api/{posts,comments}/ids takes up to 500 ids per request
 export const IDS_BATCH = 500;
+// /api/{posts,comments}/search takes up to 100
+export const SEARCH_LIMIT = 100;
+
+// An archived item with what the archive knows about its fate: it reads each item shortly after posting (retrievedOn)
+// and once more about 36 h later (recheckedOn), and records then whether it was removed or deleted (_meta.removal_type).
+// The window between the two reads is the removal window of a backfilled item.
+export interface Archived extends Observed {
+    retrievedOn: number | null;
+    recheckedOn: number | null;
+}
+
+const num = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
+
+// Folds _meta into the parsed thing: removal_type says what the re-check found, and is more precise than a body
+// still showing the text (removed after the first read) or a [removed] placeholder (removed before it)
+export function parseArchived(kind: "t1" | "t3", d: Record<string, unknown>): Archived {
+    const observed = parseThing({ kind, data: d });
+    const meta = (d._meta ?? null) as { removal_type?: unknown; retrieved_2nd_on?: unknown } | null;
+    const removalType = typeof meta?.removal_type === "string" ? meta.removal_type : null;
+    if (removalType === "deleted") Object.assign(observed, { status: "deleted", removedBy: "deleted" });
+    else if (removalType === "reddit" || removalType === "removed by reddit")
+        Object.assign(observed, { status: "removed", removedBy: "reddit" });
+    else if (removalType === "removed" && observed.status !== "removed")
+        Object.assign(observed, { status: "removed", removedBy: "removed" });
+    return { ...observed, retrievedOn: num(d.retrieved_on), recheckedOn: num(meta?.retrieved_2nd_on) };
+}
 
 // Arctic Shift archive API. It stores what it saw shortly after posting (and once more at ~36 h), so it is a
 // source of text we missed, never of an item's current state.
@@ -25,8 +51,32 @@ export class ArcticShiftBackend {
 
     // Comments it saved since `after` (unix seconds), oldest first, up to 100
     async listNewComments(subreddit: string, after: number): Promise<Observed[]> {
-        const data = await this.get(`/api/comments/search?subreddit=${subreddit}&after=${after}&sort=asc&limit=100`);
+        const data = await this.get(`/api/comments/search?subreddit=${subreddit}&after=${after}&sort=asc&limit=${SEARCH_LIMIT}`);
         return data.map((d) => parseThing({ kind: "t1", data: d }));
+    }
+
+    // Archived posts made strictly between `after` and `before` (unix seconds), newest first, up to 100
+    async listPosts(subreddit: string, after: number, before: number): Promise<Archived[]> {
+        const data = await this.get(
+            `/api/posts/search?subreddit=${subreddit}&after=${after}&before=${before}&sort=desc&limit=${SEARCH_LIMIT}`
+        );
+        return data.map((d) => parseArchived("t3", d));
+    }
+
+    // Every archived comment of a thread, oldest first, paged on created_utc (`after` is exclusive, so comments made in
+    // the same second as a page's last one could be skipped; rare, and the live checks of a young thread catch them).
+    // The API rejects small epochs as dates, so the first page has no lower bound.
+    async listThreadComments(postId: string, maxPages = 50): Promise<Archived[]> {
+        const comments: Archived[] = [];
+        let after: number | null = null;
+        for (let page = 0; page < maxPages; page++) {
+            const bound = after === null ? "" : `&after=${after}`;
+            const data = await this.get(`/api/comments/search?link_id=${postId}${bound}&sort=asc&limit=${SEARCH_LIMIT}`);
+            comments.push(...data.map((d) => parseArchived("t1", d)));
+            if (data.length < SEARCH_LIMIT) break;
+            after = Math.max(after ?? 0, ...comments.map((c) => c.createdUtc));
+        }
+        return comments;
     }
 
     // Who made the given comments disappear, for those Arctic Shift can tell: its ~36 h re-check records

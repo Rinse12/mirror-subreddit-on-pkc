@@ -5,8 +5,12 @@ import Database from "better-sqlite3";
 export type ItemKind = "post" | "comment";
 // up: last check saw it. missing: gone from a thread page, not yet confirmed (see README, Removal detection)
 export type ItemStatus = "up" | "missing" | "removed" | "deleted" | "locked";
-// skipped: a comment by one of skipAuthors, never published
+// skipped: a comment by one of skipAuthors, or an archived comment whose text the archive lost: never published,
+// replies to it go under the nearest mirrored ancestor
 export type PublishStatus = "pending" | "published" | "failed" | "skipped";
+// live: seen on Reddit by the daemon. archive: backfilled from Arctic Shift, so its removal window is the archive's
+// two reads and its note says so
+export type ItemOrigin = "live" | "archive";
 
 export interface Item {
     subreddit: string;
@@ -45,6 +49,7 @@ export interface Item {
     publishError: string | null;
     // The label already shown on the community (flair and note), "<status>:<removedBy>", so changes go out once
     publishedLabel: string | null;
+    origin: ItemOrigin;
 }
 
 export interface MirrorState {
@@ -54,6 +59,9 @@ export interface MirrorState {
     authorFlairSet: number;
     // Arctic Shift comment feed position (created_utc of the newest comment seen)
     arcticCursor: number;
+    // Backfill position: the created_utc the next page of archived posts must be older than; null before the first
+    // page. Done once it is at or below backfillSince.
+    backfillCursor: number | null;
 }
 
 export const labelOf = (item: Pick<Item, "status" | "removedBy">) => `${item.status}:${item.removedBy ?? ""}`;
@@ -85,6 +93,7 @@ CREATE TABLE IF NOT EXISTS items (
     publishStatus TEXT NOT NULL DEFAULT 'pending',
     publishError TEXT,
     publishedLabel TEXT,
+    origin TEXT NOT NULL DEFAULT 'live',
     PRIMARY KEY (subreddit, redditId)
 );
 CREATE INDEX IF NOT EXISTS items_next_check ON items (nextCheckAt) WHERE nextCheckAt IS NOT NULL;
@@ -94,9 +103,16 @@ CREATE TABLE IF NOT EXISTS mirrors (
     subreddit TEXT PRIMARY KEY,
     communityAddress TEXT,
     authorFlairSet INTEGER NOT NULL DEFAULT 0,
-    arcticCursor INTEGER NOT NULL DEFAULT 0
+    arcticCursor INTEGER NOT NULL DEFAULT 0,
+    backfillCursor INTEGER
 );
 `;
+
+// Columns added after the first release, for databases created before them
+const MIGRATIONS: [table: string, column: string, definition: string][] = [
+    ["items", "origin", "TEXT NOT NULL DEFAULT 'live'"],
+    ["mirrors", "backfillCursor", "INTEGER"]
+];
 
 const COLUMNS: (keyof Item)[] = [
     "subreddit",
@@ -123,7 +139,8 @@ const COLUMNS: (keyof Item)[] = [
     "cid",
     "publishStatus",
     "publishError",
-    "publishedLabel"
+    "publishedLabel",
+    "origin"
 ];
 
 export class StateDb {
@@ -135,6 +152,10 @@ export class StateDb {
         // WAL lets the daemon keep writing while it is read
         this.db.pragma("journal_mode = WAL");
         this.db.exec(SCHEMA);
+        for (const [table, column, definition] of MIGRATIONS) {
+            const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+            if (!columns.some((c) => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        }
     }
 
     close() {
@@ -173,7 +194,8 @@ export class StateDb {
             .all(subreddit, postId) as Item[];
     }
 
-    // Pending items whose parent is already published (or that are posts), oldest first, so parents always go first
+    // Pending items whose parent is already published (or that are posts). Live items oldest first, then backfilled ones
+    // newest first, so what happens on Reddit now never waits behind history, and history fills in from the present back
     publishable(subreddit: string, limit: number): Item[] {
         return this.db
             .prepare(
@@ -181,7 +203,7 @@ export class StateDb {
                  LEFT JOIN items p ON p.subreddit = i.subreddit AND p.redditId = i.parentId
                  WHERE i.subreddit = ? AND i.publishStatus = 'pending'
                    AND (i.kind = 'post' OR p.publishStatus IN ('published', 'skipped'))
-                 ORDER BY i.createdUtc LIMIT ?`
+                 ORDER BY i.origin = 'archive', CASE WHEN i.origin = 'archive' THEN -i.createdUtc ELSE i.createdUtc END LIMIT ?`
             )
             .all(subreddit, limit) as Item[];
     }
@@ -265,10 +287,10 @@ export class StateDb {
             .all(subreddit, maxLookups, limit) as Item[];
     }
 
-    publishedForSortData(subreddit: string): Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy">[] {
+    publishedForSortData(subreddit: string): Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy" | "goneSeenAt">[] {
         return this.db
-            .prepare("SELECT cid, score, createdUtc, status, removedBy FROM items WHERE subreddit = ? AND cid IS NOT NULL")
-            .all(subreddit) as Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy">[];
+            .prepare("SELECT cid, score, createdUtc, status, removedBy, goneSeenAt FROM items WHERE subreddit = ? AND cid IS NOT NULL")
+            .all(subreddit) as Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy" | "goneSeenAt">[];
     }
 
     mirror(subreddit: string): MirrorState {
