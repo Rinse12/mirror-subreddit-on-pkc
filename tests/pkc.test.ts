@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { communityEdit, hostedAddresses, pageSettings } from "../src/pkc.js";
+import { communityDescription, communityEdit, hostedAddresses, pageSettings } from "../src/pkc.js";
 
 const BOT = "12D3KooWBot";
 const FILE = "/srv/mirror/data/sort-data/c.json";
@@ -104,5 +104,14 @@ describe("hostedAddresses", () => {
             ])
         ).toEqual(["12D3KooWB", "12D3KooWC", "memes.bso"]);
         expect(hostedAddresses(undefined)).toEqual([]);
+    });
+});
+
+describe("communityDescription", () => {
+    it("says what the front page is", () => {
+        expect(communityDescription("AskHistorians", "removed-only")).toMatch(
+            /^What Reddit removed from r\/AskHistorians\. The front page lists only/
+        );
+        expect(communityDescription("AskScience", "reddit-hot")).toMatch(/^Posts and comments from r\/AskScience/);
     });
 });

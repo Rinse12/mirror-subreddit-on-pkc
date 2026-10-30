@@ -222,6 +222,12 @@ export function hostedAddresses(communities: unknown): string[] {
     });
 }
 
+// Set when the daemon creates the community; an owner may change it afterwards, it is never overwritten
+export const communityDescription = (subreddit: string, hotSort: HotSort) =>
+    hotSort === "removed-only"
+        ? `What Reddit removed from r/${subreddit}. The front page lists only posts that were removed or have a removed reply, most recently removed first; "new" has every post, and removed comments are flaired inside their threads.`
+        : `Posts and comments from r/${subreddit}, mirrored from Reddit, with a note on everything Reddit removes.`;
+
 // Waits for the RPC server's list of the communities it hosts
 async function hostedCommunities(pkc: PkcInstance): Promise<string[]> {
     for (let i = 0; i < 50 && !pkc.communities?.length; i++) await new Promise((resolve) => setTimeout(resolve, 200));
@@ -249,7 +255,7 @@ export async function ensureCommunity(
     } else {
         const created = await pkc.createCommunity({
             title: `r/${options.subreddit} mirror`,
-            description: `Posts and comments from r/${options.subreddit}, mirrored from Reddit, with a note on everything Reddit removes.`
+            description: communityDescription(options.subreddit, options.hotSort)
         });
         console.log(`created community ${created.address} for r/${options.subreddit}`);
         // The instance returned by createCommunity doesn't have the settings the node filled in (its default
