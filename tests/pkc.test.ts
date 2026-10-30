@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { communityDescription, communityEdit, hostedAddresses, pageSettings } from "../src/pkc.js";
+import { communityDescription, communityEdit, hostedAddresses, pageSettings, publishAndWait, PublishRejected } from "../src/pkc.js";
 
 const BOT = "12D3KooWBot";
 const FILE = "/srv/mirror/data/sort-data/c.json";
@@ -118,5 +118,36 @@ describe("communityDescription", () => {
         expect(communityDescription("NoNewNormal", "removed-only", "removed-only")).toMatch(
             /^What Reddit removed from r\/NoNewNormal: only the removed posts and comments, with the posts and parent comments they sat under for context\./
         );
+    });
+});
+
+describe("publishAndWait", () => {
+    type Listener = (...args: unknown[]) => void;
+    const publication = (events: [string, unknown][]) => {
+        const listeners = new Map<string, Listener>();
+        return {
+            on: (event: string, listener: Listener) => void listeners.set(event, listener),
+            publish: async () => {
+                for (const [event, arg] of events) listeners.get(event)?.(arg);
+            },
+            stop: async () => {}
+        };
+    };
+
+    it("resolves with the cid once the community accepts", async () => {
+        const accepted = publication([["challengeverification", { challengeSuccess: true, commentUpdate: { cid: "Qm1" } }]]);
+        await expect(publishAndWait(accepted, "post", "c.bso")).resolves.toEqual({ cid: "Qm1" });
+    });
+
+    it("treats a failed verification as a rejection, but a challenge as a transient error to retry", async () => {
+        const rejected = publication([["challengeverification", { challengeSuccess: false, reason: "over 40kb" }]]);
+        await expect(publishAndWait(rejected, "post", "c.bso")).rejects.toBeInstanceOf(PublishRejected);
+        // The bot never answers challenges; being challenged means the exclude isn't in effect right now, which a
+        // later attempt (after a settings edit, a reconnect) can fix, so the item must stay in the queue
+        const challenged = publication([["challenge", {}]]);
+        const error = await publishAndWait(challenged, "reply", "c.bso").catch((e: Error) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect(error).not.toBeInstanceOf(PublishRejected);
+        expect(String(error)).toMatch(/challenged the bot's reply/);
     });
 });

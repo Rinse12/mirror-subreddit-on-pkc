@@ -62,8 +62,8 @@ interface Verification {
 }
 
 // Publishes and resolves once the community accepts it. The bot never answers challenges: the daemon exempts its
-// key from every challenge, so being challenged means that exclude rule is missing.
-function publishAndWait(publication: Publication, what: string, communityAddress: string): Promise<{ cid?: string }> {
+// key from every challenge, so being challenged means that exclude rule isn't in effect right now.
+export function publishAndWait(publication: Publication, what: string, communityAddress: string): Promise<{ cid?: string }> {
     return new Promise((resolve, reject) => {
         let settled = false;
         const finish = (error?: Error, cid?: string) => {
@@ -75,8 +75,10 @@ function publishAndWait(publication: Publication, what: string, communityAddress
             else resolve({ cid });
         };
         const timeout = setTimeout(() => finish(new Error(`publishing the ${what} timed out`)), PUBLISH_TIMEOUT_MS);
+        // Being challenged means the exclude isn't in effect for this session: a plain error, so the item stays in
+        // the queue and is tried again later (after a reconnect or a settings edit) instead of being marked failed
         publication.on("challenge", () =>
-            finish(new PublishRejected(`${communityAddress} challenged the bot's ${what}; its key is missing from the challenge exclude`))
+            finish(new Error(`${communityAddress} challenged the bot's ${what}; its key is missing from the challenge exclude`))
         );
         publication.on("challengeverification", (verification: Verification) => {
             if (verification.challengeSuccess) finish(undefined, verification.commentUpdate?.cid);
@@ -190,14 +192,14 @@ const canonicalJson = (value: unknown): string =>
 
 // The roles and settings the community needs, built on what it has; null when nothing has to change. Settings are
 // replaced wholesale on edit, and any settings.pages change regenerates every CommentUpdate, so this only returns
-// an edit when something actually differs.
+// an edit when something actually differs, and says what (`reasons`, for the log).
 export function communityEdit(
     current: CommunityState,
     botAddress: string,
     sortDataFile: string,
     sortsDir = SORTS_DIR,
     hotSort: HotSort = "reddit-hot"
-): CommunityState | null {
+): (CommunityState & { reasons: string[] }) | null {
     const roles = current.roles?.[botAddress] ? current.roles : { ...current.roles, [botAddress]: { role: "moderator" } };
     const challenges = (current.settings?.challenges ?? []).map((challenge) =>
         challenge.exclude?.some((rule) => Object.keys(rule).length === 1 && rule.publicKeys?.includes(botAddress))
@@ -206,11 +208,12 @@ export function communityEdit(
     );
     const pages = pageSettings(sortDataFile, sortsDir, hotSort);
     const settings = { ...current.settings, challenges, pages };
-    const changed =
-        roles !== current.roles ||
-        canonicalJson(challenges) !== canonicalJson(current.settings?.challenges ?? []) ||
-        canonicalJson(pages) !== canonicalJson(current.settings?.pages);
-    return changed ? { roles, settings } : null;
+    const reasons = [
+        roles !== current.roles ? "roles" : null,
+        canonicalJson(challenges) !== canonicalJson(current.settings?.challenges ?? []) ? "challenges" : null,
+        canonicalJson(pages) !== canonicalJson(current.settings?.pages) ? "pages" : null
+    ].filter((reason): reason is string => reason !== null);
+    return reasons.length ? { roles, settings, reasons } : null;
 }
 
 // The addresses in the RPC server's list of hosted communities: plain strings on older pkc-js, `{ publicKey, name?,
@@ -286,8 +289,9 @@ export async function ensureCommunity(
     if (!local.settings) throw new Error(`${local.address} came back without its settings; is it hosted on this RPC node?`);
     const edit = communityEdit(local, options.botAddress, options.sortDataFile(local.address), options.sortsDir, options.hotSort);
     if (edit) {
-        await local.edit(edit);
-        console.log(`updated roles and settings of ${local.address}`);
+        const { reasons, ...changes } = edit;
+        await local.edit(changes);
+        console.log(`updated ${reasons.join(" and ")} of ${local.address}`);
     }
     if (!local.started) await local.start();
     return local.address;
