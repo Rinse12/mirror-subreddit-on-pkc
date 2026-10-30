@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { validatePageSortFileFactory } from "@pkcprotocol/pkc-js/page-sorts";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_FLAIRS } from "../sorts/flair-filter.js";
+import { decaySeconds, DEFAULT_FLAIRS } from "../sorts/flair-filter.js";
 import flairedHot from "../sorts/flaired-hot.js";
 import flairedReplies from "../sorts/flaired-replies.js";
 import flaired from "../sorts/flaired.js";
@@ -169,10 +169,44 @@ describe("flaired (posts)", () => {
         expect(score({ ...args("QmPost", NOW, 0, ["Deleted by author on Reddit"]), replies: [] } as never)).toBeNull();
     });
 
-    it("is also published as hot, and rejects a bad order or an empty flair list", () => {
+    it("with order hot ranks by the number of replies present, decaying with the time since the last removal", () => {
+        const { score } = flaired(settings(file(), { order: "hot", decay: "3d" }) as never);
+        const options = { order: "hot", decay: "3d" };
+        const removed = reply("QmGoneReply", ["Removed or deleted on Reddit"]);
+        const present = (n: number) => Array.from({ length: n }, (_, i) => reply(`QmUp${i}`));
+        const s = (replies: unknown[], flairs?: string[]) =>
+            score({ ...args("QmPost", NOW, 0, flairs), options, replies } as never) as number;
+        // Replies the community removed, their author deleted or that await approval don't count
+        const absent = [
+            { comment: { timestamp: NOW }, commentUpdate: { cid: "QmR", removed: true } },
+            { comment: { timestamp: NOW }, commentUpdate: { cid: "QmD", edit: { deleted: true } } },
+            { comment: { timestamp: NOW }, commentUpdate: { cid: "QmP", pendingApproval: true } }
+        ];
+        expect(s([removed, ...present(9), ...absent])).toBeCloseTo(1 + (NOW - 3600 - 1134028003) / (3 * 86400));
+        // Ten times the replies is worth the decay: a tenfold bigger thread removed-in 3 days earlier would tie
+        const tenfold = { ...args("QmGonePost", NOW, 0, [MODS]), options, replies: present(100) };
+        expect(score(tenfold as never) as number).toBeCloseTo(s([removed, ...present(9)]) + 1 - (2 * 86400 - 3600) / (3 * 86400));
+        // Still a filter: nothing flaired, nothing shown
+        expect(s(present(500))).toBeNull();
+        // A native flaired post without sort data counts its replies from the native time
+        expect(score({ ...args("QmNative", NOW - 10, 0, [MODS]), options, replies: present(10) } as never)).toBeCloseTo(
+            1 + (NOW - 10 - 1134028003) / (3 * 86400)
+        );
+        expect(decaySeconds("12h")).toBe(12 * 3600);
+        expect(decaySeconds("1w")).toBe(7 * 86400);
+        expect(decaySeconds("soon")).toBeNull();
+    });
+
+    it("is also published as hot, and rejects a bad order, decay or an empty flair list", () => {
         const sort = flairedHot(settings(file()) as never);
         expect(sort.sortName).toBe("hot");
-        expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: { order: "hot" } } } as never)).toThrow(/order/);
+        expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: { order: "busiest" } } } as never)).toThrow(/order/);
+        expect(() =>
+            sort.validatePageSortSettings!({ pageSortSettings: { options: { order: "hot", decay: "3 years" } } } as never)
+        ).toThrow(/decay/);
+        expect(() =>
+            sort.validatePageSortSettings!({ pageSortSettings: { options: { order: "hot", decay: "3d" } } } as never)
+        ).not.toThrow();
         expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: { flairs: " , " } } } as never)).toThrow(/flairs/);
         // No sort data at all is fine: a community that isn't a mirror can still filter by flair
         expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: {} } } as never)).not.toThrow();

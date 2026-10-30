@@ -16,12 +16,29 @@
             "hotSort": "removed-only",
             "backfillSince": "2026-01-01T00:00:00Z",
             "backfillOnly": "removed"
+        },
+        {
+            "subreddit": "NoNewNormal",
+            "signerPath": "data/signers/nonewnormal.json",
+            "archiveOnly": true,
+            "backfillSince": "2021-01-01T00:00:00Z",
+            "backfillOnly": "removed",
+            "publish": "removed-only",
+            "hotSort": "removed-only"
         }
     ],
     "backends": {
-        "redlib": { "instances": ["http://localhost:8080"] },
-        "reddit-json": { "userAgent": "pkc-mirror/0.1" },
-        "arctic-shift": { "baseUrl": "https://arctic-shift.photon-reddit.com" },
-        "pullpush": { "baseUrl": "https://api.pullpush.io" }
+        "redlib": {
+            "instances": ["http://localhost:8080"]
+        },
+        "reddit-json": {
+            "userAgent": "pkc-mirror/0.1"
+        },
+        "arctic-shift": {
+            "baseUrl": "https://arctic-shift.photon-reddit.com"
+        },
+        "pullpush": {
+            "baseUrl": "https://api.pullpush.io"
+        }
     }
 }

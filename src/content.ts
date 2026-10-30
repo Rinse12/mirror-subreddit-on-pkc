@@ -51,6 +51,20 @@ export function removerPhrase(item: Pick<Item, "status" | "removedBy" | "kind">)
     }
 }
 
+// The remover as a short phrase for the summary's breakdown
+export function removerShort(item: Pick<Item, "status" | "removedBy" | "kind">): string {
+    switch (removerPhrase(item)) {
+        case "Removed by moderators on Reddit":
+            return "by moderators";
+        case "Removed by Reddit admins":
+            return "by Reddit admins";
+        case "Removed or deleted on Reddit":
+            return "removed or deleted";
+        default:
+            return "by mods or admins";
+    }
+}
+
 export function statusFlair(item: Pick<Item, "status" | "removedBy" | "kind">): { text: string } | null {
     if (item.status === "up" || item.status === "missing") return null;
     if (item.status === "deleted") return { text: "Deleted by author on Reddit" };
@@ -63,27 +77,60 @@ export const ARCHIVE_NOTE = "Mirrored from the Arctic Shift archive";
 // The line the bot appends to an item it backfilled from the archive and didn't see removed
 export const archiveNote = () => `\n\n---\n\n*${ARCHIVE_NOTE}.*`;
 
+// The removal window in words: "between <up> and <gone> UTC, <age> to <age> after posting", or "within <age> of posting"
+// when the item was already gone at its first sighting (all we know is that it was up when it was made)
+export function removalWindow(item: Pick<Item, "createdUtc" | "lastSeenUpAt" | "goneSeenAt">): string {
+    if (!item.goneSeenAt) return "";
+    const sameDay = utcDate(item.lastSeenUpAt) === utcDate(item.goneSeenAt);
+    const from = `${utcDate(item.lastSeenUpAt)} ${utcTime(item.lastSeenUpAt)}`;
+    const to = sameDay ? utcTime(item.goneSeenAt) : `${utcDate(item.goneSeenAt)} ${utcTime(item.goneSeenAt)}`;
+    const age =
+        item.lastSeenUpAt <= item.createdUtc
+            ? `within ${formatDuration(Math.max(item.goneSeenAt - item.createdUtc, 60))} of posting`
+            : `${formatDuration(item.lastSeenUpAt - item.createdUtc)} to ${formatDuration(item.goneSeenAt - item.createdUtc)} after posting`;
+    return ` between ${from} and ${to} UTC, ${age}`;
+}
+
 // The line the bot appends to a removed item: who, the time window, how long after posting, the last numbers seen.
 // For a backfilled item the window is the archive's two reads, about 36 h apart, and the line says where it came from.
 export function removalNote(
     item: Pick<Item, "status" | "removedBy" | "kind" | "createdUtc" | "lastSeenUpAt" | "goneSeenAt" | "score" | "numComments" | "origin">
 ): string {
-    const parts = [item.origin === "archive" ? `${ARCHIVE_NOTE}. ${removerPhrase(item)}` : removerPhrase(item)];
-    if (item.goneSeenAt) {
-        const sameDay = utcDate(item.lastSeenUpAt) === utcDate(item.goneSeenAt);
-        const from = `${utcDate(item.lastSeenUpAt)} ${utcTime(item.lastSeenUpAt)}`;
-        const to = sameDay ? utcTime(item.goneSeenAt) : `${utcDate(item.goneSeenAt)} ${utcTime(item.goneSeenAt)}`;
-        parts[0] += ` between ${from} and ${to} UTC`;
-        // Never seen up (already gone at the first sighting): all we know is that it was up when it was made
-        parts[0] +=
-            item.lastSeenUpAt <= item.createdUtc
-                ? `, within ${formatDuration(Math.max(item.goneSeenAt - item.createdUtc, 60))} of posting`
-                : `, ${formatDuration(item.lastSeenUpAt - item.createdUtc)} to ${formatDuration(item.goneSeenAt - item.createdUtc)} after posting`;
-    }
+    const parts = [(item.origin === "archive" ? `${ARCHIVE_NOTE}. ${removerPhrase(item)}` : removerPhrase(item)) + removalWindow(item)];
     const numbers = [
         item.score !== null ? `score ${item.score}` : null,
         item.kind === "post" && item.numComments !== null ? `${item.numComments} comments` : null
     ].filter(Boolean);
     if (numbers.length) parts.push(`Last seen with ${numbers.join(", ")}.`);
     return `\n\n---\n\n*${parts[0]}.${parts.length > 1 ? ` ${parts[1]}` : ""}*`;
+}
+
+// How many removed replies the summary lists one by one; the rest are counted (a comment is limited to 40 kB)
+export const SUMMARY_LIST_LIMIT = 50;
+
+// The bot's pinned reply on a thread with removed replies: how many of the thread's comments Reddit removed, by
+// whom, and a link to each mirrored copy; a removed comment that was never published has no cid and no link.
+export function threadSummary(
+    post: Pick<Item, "numComments">,
+    comments: Pick<Item, "author" | "status" | "removedBy" | "kind" | "createdUtc" | "lastSeenUpAt" | "goneSeenAt" | "cid">[],
+    url: (cid: string) => string
+): string {
+    const removed = comments.filter((c) => c.status === "removed").sort((a, b) => (b.goneSeenAt ?? 0) - (a.goneSeenAt ?? 0));
+    const deleted = comments.filter((c) => c.status === "deleted").length;
+    const total = Math.max(post.numComments ?? 0, comments.length);
+    if (!removed.length) return "*No comment of this thread is removed on Reddit any more.*";
+    const byWhom = new Map<string, number>();
+    for (const c of removed) byWhom.set(removerShort(c), (byWhom.get(removerShort(c)) ?? 0) + 1);
+    const breakdown = byWhom.size > 1 ? [...byWhom].map(([who, n]) => `${n} ${who}`).join(", ") : [...byWhom.keys()][0];
+    const lines = [
+        `**${removed.length} of ${total} comments removed on Reddit so far** (${breakdown}).${deleted ? ` ${deleted} more ${deleted === 1 ? "was" : "were"} deleted by their authors.` : ""}`,
+        "",
+        ...removed.slice(0, SUMMARY_LIST_LIMIT).map((c) => {
+            const name = c.cid ? `[u/${c.author}](${url(c.cid)})` : `u/${c.author} (not captured)`;
+            const phrase = removerPhrase(c);
+            return `- ${name}: ${phrase[0].toLowerCase()}${phrase.slice(1)}${removalWindow(c)}`;
+        })
+    ];
+    if (removed.length > SUMMARY_LIST_LIMIT) lines.push(`- and ${removed.length - SUMMARY_LIST_LIMIT} more`);
+    return lines.join("\n");
 }

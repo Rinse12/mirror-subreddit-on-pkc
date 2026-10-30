@@ -66,16 +66,18 @@ describe("pageSettings", () => {
         ).toBe(true);
     });
 
-    it("with hotSort removed-only serves the flaired filter as `hot` and moves Reddit's hot order to its own name", () => {
+    it("with hotSort removed-only serves the flaired filter as `hot`, busiest first, keeps the recent order under `flaired` and moves Reddit's hot order to its own name", () => {
         const pages = pageSettings(FILE, undefined, "removed-only");
         expect(named(pages.posts)).toEqual([
             ["flaired-hot.js", true],
+            ["flaired.js", false],
             ["mirrored-reddit-hot.js", false],
             ["new.js", false],
             ["removed-first.js", false],
             ["active", "built-in"]
         ]);
-        expect(files(pages.posts)[0].options).toEqual({ sortDataPath: FILE, order: "flaired" });
+        expect(files(pages.posts)[0].options).toEqual({ sortDataPath: FILE, order: "hot", decay: "3d" });
+        expect(files(pages.posts)[1].options).toEqual({ sortDataPath: FILE, order: "flaired" });
         expect(communityEdit({ settings: { challenges: [] } }, BOT, FILE, undefined, "removed-only")?.settings?.pages).toEqual(pages);
     });
 });
@@ -110,8 +112,11 @@ describe("hostedAddresses", () => {
 describe("communityDescription", () => {
     it("says what the front page is", () => {
         expect(communityDescription("AskHistorians", "removed-only")).toMatch(
-            /^What Reddit removed from r\/AskHistorians\. The front page lists only/
+            /^What Reddit removed from r\/AskHistorians\. The front page lists only .* busiest first;/
         );
         expect(communityDescription("AskScience", "reddit-hot")).toMatch(/^Posts and comments from r\/AskScience/);
+        expect(communityDescription("NoNewNormal", "removed-only", "removed-only")).toMatch(
+            /^What Reddit removed from r\/NoNewNormal: only the removed posts and comments, with the posts and parent comments they sat under for context\./
+        );
     });
 });

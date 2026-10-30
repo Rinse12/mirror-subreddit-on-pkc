@@ -149,19 +149,21 @@ const sortEntry = (sortsDir: string, file: string, sortDataFile: string, preload
 });
 
 export type HotSort = MirrorConfig["hotSort"];
+export type PublishMode = MirrorConfig["publish"];
 
 // The page sorts of a mirror community (see README, Scores). Post sorts take the built-in names Seedit requests (`hot`
 // preloaded, `new`, `active`), since a path file under a built-in name keeps the community's order on the client while a
-// name nobody asks for is never shown. With hotSort "removed-only" the flaired filter is what `hot` serves, and Reddit's
-// hot order moves to `mirrored-reddit-hot`. The reply sort keeps its own name: a reply file published as `best` would
-// be re-sorted by the client.
+// name nobody asks for is never shown. With hotSort "removed-only" the flaired filter is what `hot` serves, busiest
+// threads first, Reddit's hot order moves to `mirrored-reddit-hot`, and `flaired` keeps the most-recently-removed order
+// under its own name. The reply sort keeps its own name: a reply file published as `best` would be re-sorted by the client.
 export function pageSettings(sortDataFile: string, sortsDir = SORTS_DIR, hotSort: HotSort = "reddit-hot") {
     const flairedOptions = { order: "flaired" };
     return {
         posts: [
             ...(hotSort === "removed-only"
                 ? [
-                      sortEntry(sortsDir, "flaired-hot.js", sortDataFile, true, flairedOptions),
+                      sortEntry(sortsDir, "flaired-hot.js", sortDataFile, true, { order: "hot", decay: "3d" }),
+                      sortEntry(sortsDir, "flaired.js", sortDataFile, false, flairedOptions),
                       sortEntry(sortsDir, "mirrored-reddit-hot.js", sortDataFile, false, { nativeWeight: "1" })
                   ]
                 : [
@@ -223,10 +225,17 @@ export function hostedAddresses(communities: unknown): string[] {
 }
 
 // Set when the daemon creates the community; an owner may change it afterwards, it is never overwritten
-export const communityDescription = (subreddit: string, hotSort: HotSort) =>
-    hotSort === "removed-only"
-        ? `What Reddit removed from r/${subreddit}. The front page lists only posts that were removed or have a removed reply, most recently removed first; "new" has every post, and removed comments are flaired inside their threads.`
-        : `Posts and comments from r/${subreddit}, mirrored from Reddit, with a note on everything Reddit removes.`;
+export const communityDescription = (subreddit: string, hotSort: HotSort, publish: PublishMode = "all") => {
+    const front =
+        hotSort === "removed-only"
+            ? "The front page lists only posts that were removed or have a removed reply, busiest first"
+            : "The front page is Reddit's hot order";
+    return publish === "removed-only"
+        ? `What Reddit removed from r/${subreddit}: only the removed posts and comments, with the posts and parent comments they sat under for context. ${front}.`
+        : hotSort === "removed-only"
+          ? `What Reddit removed from r/${subreddit}. ${front}; "new" has every post, and removed comments are flaired inside their threads.`
+          : `Posts and comments from r/${subreddit}, mirrored from Reddit, with a note on everything Reddit removes.`;
+};
 
 // Waits for the RPC server's list of the communities it hosts
 async function hostedCommunities(pkc: PkcInstance): Promise<string[]> {
@@ -245,6 +254,7 @@ export async function ensureCommunity(
         sortsDir: string;
         sortDataFile: (address: string) => string;
         hotSort: HotSort;
+        publish: PublishMode;
     }
 ): Promise<string> {
     let community;
@@ -255,7 +265,7 @@ export async function ensureCommunity(
     } else {
         const created = await pkc.createCommunity({
             title: `r/${options.subreddit} mirror`,
-            description: communityDescription(options.subreddit, options.hotSort)
+            description: communityDescription(options.subreddit, options.hotSort, options.publish)
         });
         console.log(`created community ${created.address} for r/${options.subreddit}`);
         // The instance returned by createCommunity doesn't have the settings the node filled in (its default

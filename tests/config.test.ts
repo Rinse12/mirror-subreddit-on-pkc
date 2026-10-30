@@ -16,19 +16,26 @@ describe("parseConfig", () => {
             backfillOnly: "removed",
             backfillSince: "2026-01-01T00:00:00Z"
         });
+        expect(config.mirrors[2]).toMatchObject({ subreddit: "NoNewNormal", archiveOnly: true, publish: "removed-only" });
     });
 
     it("fills in defaults", () => {
         const config = parseConfig({ mirrors: [mirror] }, "/srv/mirror");
         expect(config.rpcUrl).toBe("ws://localhost:9138");
         expect(config.dataDir).toBe("/srv/mirror/data");
+        expect(config.clientUrl).toBe("https://seedit.app");
         expect(config.mirrors[0]).toMatchObject({
+            name: "AskHistorians",
             communityAddress: "ah.bso",
             commentUpdateDays: 7,
             minScore: 0,
             authorDeleted: "hide",
             maxCommentsPerPost: null,
             hotSort: "reddit-hot",
+            publish: "all",
+            context: "ancestors",
+            threadSummary: false,
+            archiveOnly: false,
             backfillSince: null,
             backfillOnly: "all"
         });
@@ -40,9 +47,20 @@ describe("parseConfig", () => {
         expect(() => parseConfig({ mirrors: [{ ...mirror, subreddit: "r/AskHistorians" }] })).toThrow(/mirrors\.0\.subreddit/);
     });
 
-    it("rejects two mirrors of the same subreddit or community", () => {
+    it("rejects two mirrors of the same name or community, and lets one subreddit be mirrored twice under different names", () => {
         const other = { subreddit: "askhistorians", communityAddress: "ah.bso", signerPath: "data/signers/other.json" };
-        expect(() => parseConfig({ mirrors: [mirror, other] })).toThrow(/duplicate subreddit[\s\S]*duplicate communityAddress/);
+        expect(() => parseConfig({ mirrors: [mirror, other] })).toThrow(/duplicate name[\s\S]*duplicate communityAddress/);
+        const removed = { ...other, name: "askhistorians-removed", communityAddress: null, publish: "removed-only" };
+        expect(parseConfig({ mirrors: [mirror, removed] }).mirrors.map((m) => m.name)).toEqual(["AskHistorians", "askhistorians-removed"]);
+    });
+
+    it("requires backfillSince with archiveOnly", () => {
+        expect(() => parseConfig({ mirrors: [{ ...mirror, archiveOnly: true }] })).toThrow(
+            /mirrors\.0\.backfillSince: required with archiveOnly/
+        );
+        expect(
+            parseConfig({ mirrors: [{ ...mirror, archiveOnly: true, backfillSince: "2021-01-01T00:00:00Z" }] }).mirrors[0].archiveOnly
+        ).toBe(true);
     });
 
     it("lets the daemon create the community when no address is given", () => {

@@ -5,7 +5,10 @@
 //
 // Posts: a post is kept when it or any reply under it (pkc-js hands every descendant to a requireReplies sort)
 // carries one of the flairs. `order` is "flaired" (the most recently flaired first, from the mirror's sort data,
-// falling back to the post's time) or "new" (newest post first).
+// falling back to the post's time), "new" (newest post first) or "hot": Reddit's hot formula with the number of
+// replies under the post as the score and the latest flairing as the time, so the busiest threads come first and
+// a tenfold of replies is worth `decay` (default 3 days) of recency. Every reply present on the community counts,
+// native ones included; replies the community removed, their author deleted or that await approval don't.
 //
 // Replies: a flat page of the flaired replies in the thread, so a removed answer shows even when its parent is
 // up, in mirrored-reddit-best order.
@@ -21,6 +24,8 @@ import {
 
 export const FLAIRS_OPTION = "flairs";
 export const ORDER_OPTION = "order";
+export const DECAY_OPTION = "decay";
+export const DEFAULT_DECAY = "3d";
 // The mirror's removal flairs (src/content.ts, statusFlair), minus author deletions and locks
 export const DEFAULT_FLAIRS = [
     "Removed by mods on Reddit",
@@ -28,7 +33,10 @@ export const DEFAULT_FLAIRS = [
     "Removed on Reddit",
     "Removed or deleted on Reddit"
 ];
-const ORDERS = ["flaired", "new"];
+const ORDERS = ["flaired", "new", "hot"];
+const DECAY_UNITS = { h: 3600, d: 86400, w: 7 * 86400 };
+// Reddit's epoch, the origin of its hot formula's time term
+const REDDIT_EPOCH = 1134028003;
 
 const flairsOption = {
     option: FLAIRS_OPTION,
@@ -39,9 +47,28 @@ const flairsOption = {
 const orderOption = {
     option: ORDER_OPTION,
     label: "Order",
-    description: `"flaired": most recently flaired first (needs the mirror's sort data, else the post's time); "new": newest post first`,
+    description: `"flaired": most recently flaired first (needs the mirror's sort data, else the post's time); "new": newest post first; "hot": most replies first, decaying with the time since the last flairing`,
     placeholder: "flaired"
 };
+const decayOption = {
+    option: DECAY_OPTION,
+    label: "Decay",
+    description: `With order "hot": how much recency a tenfold of replies is worth, e.g. "12h", "3d", "1w"`,
+    placeholder: DEFAULT_DECAY
+};
+
+// "3d" -> seconds; null when malformed
+export function decaySeconds(raw) {
+    const match = /^(\d+(?:\.\d+)?)\s*([hdw])$/.exec(String(raw ?? DEFAULT_DECAY).trim());
+    return match && Number(match[1]) > 0 ? Number(match[1]) * DECAY_UNITS[match[2]] : null;
+}
+
+// A reply that is on the community: not removed by its mods, not deleted by its author, not awaiting approval
+export const isPresent = ({ commentUpdate }) =>
+    commentUpdate?.removed !== true &&
+    commentUpdate?.edit?.deleted !== true &&
+    commentUpdate?.pendingApproval !== true &&
+    commentUpdate?.approved !== false;
 const sortDataOption = {
     ...dataOptionInputs.find((input) => input.option === SORT_DATA_PATH_OPTION),
     description: "Optional: the mirror daemon's JSON file for this community, for the flaired order and Reddit scores"
@@ -68,6 +95,8 @@ function validate({ pageSortSettings }) {
         throw new Error(`${FLAIRS_OPTION} must list at least one flair text`);
     if (options[ORDER_OPTION] !== undefined && !ORDERS.includes(options[ORDER_OPTION]))
         throw new Error(`${ORDER_OPTION} must be one of ${ORDERS.join(", ")}, got "${options[ORDER_OPTION]}"`);
+    if (options[DECAY_OPTION] !== undefined && decaySeconds(options[DECAY_OPTION]) === null)
+        throw new Error(`${DECAY_OPTION} must be a number of hours, days or weeks like "3d", got "${options[DECAY_OPTION]}"`);
     const weight = options[NATIVE_WEIGHT_OPTION];
     if (weight !== undefined && !Number.isFinite(Number(weight)))
         throw new Error(`${NATIVE_WEIGHT_OPTION} must be a number, got "${weight}"`);
@@ -78,11 +107,12 @@ export function flairedPostsSort(sortName) {
         const data = sortData(pageSortSettings.options?.[SORT_DATA_PATH_OPTION]);
         return {
             sortName,
-            description: "Only posts that carry one of the configured flairs, or have a reply that does; most recently flaired first",
+            description:
+                "Only posts that carry one of the configured flairs, or have a reply that does; most recently flaired first, newest first, or the busiest first",
             scope: "posts",
             requireReplies: true,
-            optionInputs: [flairsOption, orderOption, sortDataOption],
-            defaultOptions: { [FLAIRS_OPTION]: DEFAULT_FLAIRS.join(","), [ORDER_OPTION]: "flaired" },
+            optionInputs: [flairsOption, orderOption, decayOption, sortDataOption],
+            defaultOptions: { [FLAIRS_OPTION]: DEFAULT_FLAIRS.join(","), [ORDER_OPTION]: "flaired", [DECAY_OPTION]: DEFAULT_DECAY },
             score: ({ comment, commentUpdate, options, replies }) => {
                 const wanted = flairSet(options);
                 const own = hasFlair(comment, commentUpdate, wanted);
@@ -96,7 +126,10 @@ export function flairedPostsSort(sortName) {
                     const at = entryOf(data.map, reply.commentUpdate)?.flairedAt;
                     if (at) flairedAt = Math.max(flairedAt ?? 0, at);
                 }
-                return flairedAt ?? created;
+                if (options?.[ORDER_OPTION] !== "hot") return flairedAt ?? created;
+                const count = (replies ?? []).filter(isPresent).length;
+                const decay = decaySeconds(options?.[DECAY_OPTION]) ?? decaySeconds(DEFAULT_DECAY);
+                return Math.log10(Math.max(count, 1)) + ((flairedAt ?? created) - REDDIT_EPOCH) / decay;
             },
             validatePageSortSettings: validate
         };

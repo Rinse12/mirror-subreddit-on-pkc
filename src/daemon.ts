@@ -9,7 +9,7 @@ import { RedlibBackend } from "./backends/redlib.js";
 import { SourcePool } from "./backends/source-pool.js";
 import { type Config, loadConfig, type MirrorConfig } from "./config.js";
 import { StateDb } from "./db.js";
-import { type Archives, Mirror, type Publisher } from "./mirror.js";
+import { type Archives, Mirror, mirrorLabel, type Publisher } from "./mirror.js";
 import { createPkc, ensureCommunity, loadSigner, type PkcInstance, publishComment, publishEdit, publishModeration } from "./pkc.js";
 import { localNodeFiles, type NodeFiles, remoteNodeFiles } from "./node-files.js";
 import { sortDataPath, writeSortData } from "./sort-data.js";
@@ -45,9 +45,9 @@ function archivesOf(config: Config): Archives {
     };
 }
 
-function dryRunPublisher(subreddit: string): Publisher {
+function dryRunPublisher(mirror: MirrorConfig): Publisher {
     let n = 0;
-    const log = (message: string) => console.log(`[r/${subreddit}] dry run: ${message}`);
+    const log = (message: string) => console.log(`[${mirrorLabel(mirror)}] dry run: ${message}`);
     return {
         async comment(c) {
             log(`would publish ${c.parentCid ? `reply under ${c.parentCid}` : `post "${c.title}"`}: ${c.content.split("\n")[0]}`);
@@ -58,34 +58,48 @@ function dryRunPublisher(subreddit: string): Publisher {
         },
         async moderate(cid, moderation) {
             log(`would moderate ${cid}: ${JSON.stringify(moderation)}`);
-        }
+        },
+        url: (cid) => `dry-run://${cid}`
     };
 }
 
-async function pkcPublisher(pkc: PkcInstance, db: StateDb, nodeFiles: NodeFiles, mirror: MirrorConfig): Promise<Publisher> {
+// Where a client opens a comment of the community (Seedit's scheme, the base from `clientUrl`)
+export const commentUrl = (clientUrl: string, communityAddress: string, cid: string) =>
+    `${clientUrl.replace(/\/$/, "")}/#/p/${communityAddress}/c/${cid}`;
+
+async function pkcPublisher(pkc: PkcInstance, db: StateDb, nodeFiles: NodeFiles, config: Config, mirror: MirrorConfig): Promise<Publisher> {
     const signer = await loadSigner(pkc, mirror.signerPath);
     const address = await ensureCommunity(pkc, {
-        address: mirror.communityAddress ?? db.mirror(mirror.subreddit).communityAddress,
+        address: mirror.communityAddress ?? db.mirror(mirror.name).communityAddress,
         subreddit: mirror.subreddit,
         botAddress: signer.address,
         sortsDir: nodeFiles.sortsDir,
         sortDataFile: nodeFiles.sortDataFile,
-        hotSort: mirror.hotSort
+        hotSort: mirror.hotSort,
+        publish: mirror.publish
     });
-    db.updateMirror(mirror.subreddit, { communityAddress: address });
-    console.log(`[r/${mirror.subreddit}] mirroring into ${address} as ${signer.address}`);
+    db.updateMirror(mirror.name, { communityAddress: address });
+    console.log(`[${mirrorLabel(mirror)}] mirroring into ${address} as ${signer.address}`);
     return {
         comment: (c) => publishComment(pkc, signer, address, c),
         edit: (cid, content) => publishEdit(pkc, signer, address, cid, content),
-        moderate: (cid, moderation) => publishModeration(pkc, signer, address, cid, moderation)
+        moderate: (cid, moderation) => publishModeration(pkc, signer, address, cid, moderation),
+        url: (cid) => commentUrl(config.clientUrl, address, cid)
     };
 }
 
-function tasksOf(mirror: Mirror, mirrorConfig: MirrorConfig, db: StateDb, config: Config, nodeFiles: NodeFiles): Task[] {
+// The tasks of one mirror. An archive-only mirror (a banned subreddit) asks no live source: no post discovery, no
+// thread re-checks, no Arctic Shift comment feed; the backfill walk is its only source.
+export function tasksOf(mirror: Mirror, mirrorConfig: MirrorConfig, db: StateDb, config: Config, nodeFiles: NodeFiles): Task[] {
+    const label = mirrorLabel(mirrorConfig);
     const tasks: Task[] = [
-        { name: "discover posts", everyMs: 2 * MINUTE, run: () => mirror.discoverPosts() },
-        { name: "check threads", everyMs: MINUTE, run: () => mirror.checkDuePosts(30) },
-        { name: "Arctic Shift feed", everyMs: 3 * MINUTE, run: () => mirror.readArcticFeed() },
+        ...(mirrorConfig.archiveOnly
+            ? []
+            : [
+                  { name: "discover posts", everyMs: 2 * MINUTE, run: () => mirror.discoverPosts() },
+                  { name: "check threads", everyMs: MINUTE, run: () => mirror.checkDuePosts(30) },
+                  { name: "Arctic Shift feed", everyMs: 3 * MINUTE, run: () => mirror.readArcticFeed() }
+              ]),
         { name: "skip authors", everyMs: 10 * MINUTE, run: () => mirror.skipAuthors() },
         { name: "missing text", everyMs: 30 * MINUTE, run: () => mirror.fillMissingText() },
         { name: "removal labels", everyMs: 60 * MINUTE, run: () => mirror.labelGoneComments() },
@@ -94,7 +108,7 @@ function tasksOf(mirror: Mirror, mirrorConfig: MirrorConfig, db: StateDb, config
             everyMs: MINUTE,
             run: async () => {
                 const n = await mirror.publishPending(100);
-                if (n) console.log(`[r/${mirror.subreddit}] published ${n} posts and replies`);
+                if (n) console.log(`[${label}] published ${n} posts and replies`);
             }
         },
         {
@@ -102,20 +116,21 @@ function tasksOf(mirror: Mirror, mirrorConfig: MirrorConfig, db: StateDb, config
             everyMs: MINUTE,
             run: async () => {
                 const n = await mirror.publishLabels(100);
-                if (n) console.log(`[r/${mirror.subreddit}] updated the flair and note of ${n} items`);
+                if (n) console.log(`[${label}] updated the flair and note of ${n} items`);
             }
         }
     ];
+    if (mirrorConfig.threadSummary) tasks.push({ name: "thread summaries", everyMs: 5 * MINUTE, run: () => mirror.updateSummaries() });
     // A few archived threads per tick, between the live tasks; a no-op once the cursor reached backfillSince
     if (mirrorConfig.backfillSince) tasks.push({ name: "backfill", everyMs: 0, run: () => mirror.backfill(5) });
-    const address = db.mirror(mirror.subreddit).communityAddress;
+    const address = db.mirror(mirror.key).communityAddress;
     if (address && !DRY_RUN)
         tasks.push({
             name: "sort data",
             everyMs: 5 * MINUTE,
             run: async () => {
                 const file = sortDataPath(config.dataDir, address);
-                await writeSortData(db, mirror.subreddit, file);
+                await writeSortData(db, mirror.key, file);
                 await nodeFiles.pushSortData(file, address);
             }
         });
@@ -141,10 +156,10 @@ async function main() {
 
     const scheduled: { label: string; task: Task; nextAt: number }[] = [];
     for (const mirrorConfig of config.mirrors) {
-        const publisher = pkc ? await pkcPublisher(pkc, db, nodeFiles, mirrorConfig) : dryRunPublisher(mirrorConfig.subreddit);
+        const publisher = pkc ? await pkcPublisher(pkc, db, nodeFiles, config, mirrorConfig) : dryRunPublisher(mirrorConfig);
         const mirror = new Mirror(db, mirrorConfig, live, archives, publisher);
         for (const task of tasksOf(mirror, mirrorConfig, db, config, nodeFiles))
-            scheduled.push({ label: `r/${mirrorConfig.subreddit} ${task.name}`, task, nextAt: 0 });
+            scheduled.push({ label: `${mirrorLabel(mirrorConfig)} ${task.name}`, task, nextAt: 0 });
     }
 
     let stopping = false;

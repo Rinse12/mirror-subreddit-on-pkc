@@ -10,7 +10,7 @@ const HOUR = 3600;
 const DAY = 24 * HOUR;
 
 const item = (overrides: Partial<Item> = {}): Item => ({
-    subreddit: "AskHistorians",
+    mirror: "AskHistorians",
     redditId: "t3_1xfd707",
     kind: "post",
     postId: "t3_1xfd707",
@@ -36,6 +36,8 @@ const item = (overrides: Partial<Item> = {}): Item => ({
     publishError: null,
     publishedLabel: null,
     origin: "live",
+    summaryCid: null,
+    summaryText: null,
     ...overrides
 });
 
@@ -65,7 +67,7 @@ describe("StateDb", () => {
         expect(db.publishable("AskHistorians", 10).map((i) => i.redditId)).toEqual(["t3_live_first", "t3_live", "t3_old", "t3_older"]);
     });
 
-    it("adds the columns a database from before backfill lacks", () => {
+    it("adds the columns a database from before backfill lacks, and keys old rows by the mirror's name", () => {
         const file = path.join(mkdtempSync(path.join(os.tmpdir(), "state-")), "state.sqlite");
         const old = new Database(file);
         old.exec(`CREATE TABLE items (subreddit TEXT NOT NULL, redditId TEXT NOT NULL, kind TEXT NOT NULL, postId TEXT NOT NULL, parentId TEXT,
@@ -78,8 +80,74 @@ describe("StateDb", () => {
             VALUES ('AskHistorians', 't3_a', 'post', 't3_a', 'x', 1, '/r/a', 'up', 1);`);
         old.close();
         db = new StateDb(file);
-        expect(db.get("AskHistorians", "t3_a")).toMatchObject({ origin: "live" });
+        expect(db.get("AskHistorians", "t3_a")).toMatchObject({ mirror: "AskHistorians", origin: "live", summaryCid: null });
         expect(db.mirror("AskHistorians").backfillCursor).toBeNull();
+        // Opening it again finds nothing left to migrate
+        db.close();
+        db = new StateDb(file);
+        expect(db.get("AskHistorians", "t3_a")).toBeDefined();
+    });
+
+    describe("publishable on a removed-only mirror", () => {
+        // post > a (up) > b (removed) > c (up) > d (removed); e (up) under the post; f (deleted by its author)
+        const thread = () => {
+            db = new StateDb(":memory:");
+            db.insert(item());
+            db.insert(comment("t1_a", "t3_1xfd707", 1100));
+            db.insert({ ...comment("t1_b", "t1_a", 1200), status: "removed", removedBy: "gone" });
+            db.insert(comment("t1_c", "t1_b", 1300));
+            db.insert({ ...comment("t1_d", "t1_c", 1400), status: "removed", removedBy: "moderator" });
+            db.insert(comment("t1_e", "t3_1xfd707", 1500));
+            db.insert({ ...comment("t1_f", "t3_1xfd707", 1600), status: "deleted", removedBy: "deleted" });
+        };
+        const ids = (filter: Parameters<StateDb["publishable"]>[2]) => db.publishable("AskHistorians", 10, filter).map((i) => i.redditId);
+        const published = (id: string) => db.update("AskHistorians", id, { publishStatus: "published", cid: `Qm_${id}` });
+
+        it("offers the removed items and, with context ancestors, the chain of parents above them", () => {
+            thread();
+            expect(ids({ context: "ancestors" })).toEqual(["t3_1xfd707"]);
+            published("t3_1xfd707");
+            expect(ids({ context: "ancestors" })).toEqual(["t1_a"]);
+            published("t1_a");
+            expect(ids({ context: "ancestors" })).toEqual(["t1_b"]);
+            published("t1_b");
+            published("t1_c");
+            expect(ids({ context: "ancestors" })).toEqual(["t1_d"]);
+        });
+
+        it("with context post offers a removed reply as soon as its post is out, skipping the parents", () => {
+            thread();
+            published("t3_1xfd707");
+            expect(ids({ context: "post" })).toEqual(["t1_b", "t1_d"]);
+        });
+
+        it("offers a post without removals only on a full mirror", () => {
+            db = new StateDb(":memory:");
+            db.insert(item());
+            db.insert({ ...comment("t1_f", "t3_1xfd707", 1600), status: "deleted", removedBy: "deleted" });
+            expect(ids({ context: "ancestors" })).toEqual([]);
+            expect(ids(null)).toEqual(["t3_1xfd707"]);
+        });
+    });
+
+    it("lists the published posts that have a removed reply or a summary to retire", () => {
+        db = new StateDb(":memory:");
+        db.insert(item({ publishStatus: "published", cid: "Qm1" }));
+        db.insert(item({ redditId: "t3_quiet", postId: "t3_quiet", publishStatus: "published", cid: "Qm2" }));
+        db.insert(
+            item({
+                redditId: "t3_retired",
+                postId: "t3_retired",
+                publishStatus: "published",
+                cid: "Qm3",
+                summaryCid: "Qm4",
+                summaryText: "x"
+            })
+        );
+        db.insert({ ...comment("t1_a", "t3_1xfd707", 1100), status: "removed", removedBy: "gone" });
+        expect(db.postsForSummary("AskHistorians").map((p) => p.redditId)).toEqual(["t3_1xfd707", "t3_retired"]);
+        db.unpublishThread("AskHistorians", "t3_retired");
+        expect(db.get("AskHistorians", "t3_retired")).toMatchObject({ publishStatus: "pending", summaryCid: null, summaryText: null });
     });
 
     it("lists labels not yet shown, skipping unconfirmed missing items", () => {
@@ -106,7 +174,7 @@ describe("StateDb", () => {
     it("keeps one row of state per mirror", () => {
         db = new StateDb(":memory:");
         expect(db.mirror("AskHistorians")).toEqual({
-            subreddit: "AskHistorians",
+            name: "AskHistorians",
             communityAddress: null,
             authorFlairSet: 0,
             arcticCursor: 0,

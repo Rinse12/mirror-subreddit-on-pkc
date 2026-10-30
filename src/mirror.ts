@@ -10,9 +10,10 @@ import {
     mirroredContent,
     mirroredTitle,
     removalNote,
-    statusFlair
+    statusFlair,
+    threadSummary
 } from "./content.js";
-import { type Item, labelOf, type StateDb } from "./db.js";
+import { type Item, labelOf, type PublishFilter, type StateDb } from "./db.js";
 import type { Moderation, NewComment } from "./pkc.js";
 import { PublishRejected } from "./pkc.js";
 import { isRedditId, type Observed } from "./reddit.js";
@@ -45,6 +46,8 @@ export interface Publisher {
     comment(comment: NewComment): Promise<string>;
     edit(commentCid: string, content: string): Promise<void>;
     moderate(commentCid: string, moderation: Moderation): Promise<void>;
+    // Where a reader opens the comment with that cid, for links in bot replies
+    url(commentCid: string): string;
 }
 
 // How sure a removedBy is: a later, vaguer sighting never replaces a more precise one
@@ -57,8 +60,14 @@ const isGone = (status: Item["status"]) => status === "removed" || status === "d
 // kept), or a removed comment whose text the archive kept
 const removedWithText = (item: Archived) => item.status === "removed" && (item.kind === "post" || item.body !== null);
 
+// What the log prefix and the state key of a mirror look like: the subreddit, unless the mirror was named
+export const mirrorLabel = (config: Pick<MirrorConfig, "name" | "subreddit">) =>
+    config.name === config.subreddit ? `r/${config.subreddit}` : config.name;
+
 export class Mirror {
     readonly subreddit: string;
+    // The key of this mirror's rows in the database (config `name`)
+    readonly key: string;
     // The page of archived posts the backfill is working through, newest first
     private backfillPage: Archived[] = [];
 
@@ -69,9 +78,15 @@ export class Mirror {
         private readonly archives: Archives,
         private readonly publisher: Publisher,
         private readonly now: () => number = () => Math.floor(Date.now() / 1000),
-        private readonly log: (message: string) => void = (message) => console.log(`[r/${config.subreddit}] ${message}`)
+        private readonly log: (message: string) => void = (message) => console.log(`[${mirrorLabel(config)}] ${message}`)
     ) {
         this.subreddit = config.subreddit;
+        this.key = config.name;
+    }
+
+    // What publishPending offers: everything, or with publish "removed-only" the removed items and their context
+    private get publishFilter(): PublishFilter {
+        return this.config.publish === "removed-only" ? { context: this.config.context } : null;
     }
 
     private skips(author: string): boolean {
@@ -81,7 +96,7 @@ export class Mirror {
     private newItem(observed: Observed, now: number): Item {
         const gone = isGone(observed.status);
         return {
-            subreddit: this.subreddit,
+            mirror: this.key,
             ...observed,
             // Already gone when first seen: all we know is that it was up when it was made
             lastSeenUpAt: gone ? observed.createdUtc : now,
@@ -94,7 +109,9 @@ export class Mirror {
             publishStatus: observed.kind === "comment" && this.skips(observed.author) ? "skipped" : "pending",
             publishError: null,
             publishedLabel: null,
-            origin: "live"
+            origin: "live",
+            summaryCid: null,
+            summaryText: null
         };
     }
 
@@ -143,14 +160,14 @@ export class Mirror {
         } else {
             Object.assign(changes, { status: observed.status, removedBy: null, goneSeenAt: null, lastSeenUpAt: now });
         }
-        this.db.update(this.subreddit, item.redditId, changes);
+        this.db.update(this.key, item.redditId, changes);
     }
 
     private record(observed: Observed, now: number): Item {
-        const item = this.db.get(this.subreddit, observed.redditId);
+        const item = this.db.get(this.key, observed.redditId);
         if (item) this.observe(item, observed, now);
         else this.db.insert(this.newItem(observed, now));
-        return this.db.get(this.subreddit, observed.redditId)!;
+        return this.db.get(this.key, observed.redditId)!;
     }
 
     async discoverPosts(): Promise<number> {
@@ -159,7 +176,7 @@ export class Mirror {
         let added = 0;
         this.db.transaction(() => {
             for (const post of posts) {
-                const known = this.db.get(this.subreddit, post.redditId);
+                const known = this.db.get(this.key, post.redditId);
                 if (!known && post.score !== null && post.score < this.config.minScore) continue;
                 if (!known) added++;
                 this.record(post, now);
@@ -171,12 +188,12 @@ export class Mirror {
 
     // A thread no source can load is retried in 10 min, without holding up the other due threads
     async checkDuePosts(limit: number): Promise<void> {
-        for (const post of this.db.duePosts(this.subreddit, this.now(), limit)) {
+        for (const post of this.db.duePosts(this.key, this.now(), limit)) {
             try {
                 await this.checkThread(post);
             } catch (error) {
                 this.log(`${post.redditId}: thread check failed: ${error instanceof Error ? error.message : error}`);
-                this.db.update(this.subreddit, post.redditId, { nextCheckAt: this.now() + THREAD_RETRY });
+                this.db.update(this.key, post.redditId, { nextCheckAt: this.now() + THREAD_RETRY });
             }
         }
     }
@@ -194,20 +211,20 @@ export class Mirror {
                 seen.add(comment.redditId);
                 this.record(comment, now);
             }
-            this.db.update(this.subreddit, post.redditId, {
+            this.db.update(this.key, post.redditId, {
                 nextCheckAt: nextCheckAt(post.createdUtc, now, this.config.commentUpdateDays)
             });
         });
         const vanished = this.db
-            .commentsOf(this.subreddit, post.redditId)
+            .commentsOf(this.key, post.redditId)
             .filter((c) => !seen.has(c.redditId) && !isGone(c.status) && c.publishStatus !== "skipped");
         for (const comment of vanished) {
-            if (comment.status !== "missing") this.db.update(this.subreddit, comment.redditId, { status: "missing", goneSeenAt: now });
+            if (comment.status !== "missing") this.db.update(this.key, comment.redditId, { status: "missing", goneSeenAt: now });
             const current = await this.live.run((source) => source.checkComment(comment.permalink, comment.redditId));
-            const fresh = this.db.get(this.subreddit, comment.redditId)!;
+            const fresh = this.db.get(this.key, comment.redditId)!;
             if (current) this.observe(fresh, current, this.now());
             else
-                this.db.update(this.subreddit, comment.redditId, {
+                this.db.update(this.key, comment.redditId, {
                     status: "removed",
                     removedBy: "gone",
                     // Held back by the cap, but a removed reply is always worth publishing
@@ -220,7 +237,7 @@ export class Mirror {
     // New comments whose parent the source didn't show (a deleted comment, on Redlib) get it from Arctic Shift, or
     // hang under the post when it doesn't know it or we never captured that parent. Known comments keep the parent they were first seen with.
     private async resolveParents(comments: Observed[]): Promise<void> {
-        const orphans = comments.filter((c) => c.parentId === null && !this.db.get(this.subreddit, c.redditId));
+        const orphans = comments.filter((c) => c.parentId === null && !this.db.get(this.key, c.redditId));
         if (!orphans.length) return;
         const parents = new Map<string, string | null>();
         try {
@@ -232,7 +249,7 @@ export class Mirror {
         // A parent we never captured can't be published, so the reply hangs under the post instead
         for (const c of orphans) {
             const parent = parents.get(c.redditId);
-            c.parentId = parent && this.db.get(this.subreddit, parent) ? parent : c.postId;
+            c.parentId = parent && this.db.get(this.key, parent) ? parent : c.postId;
         }
     }
 
@@ -246,12 +263,12 @@ export class Mirror {
     async backfill(maxPosts = 5): Promise<number> {
         const since = this.backfillSince();
         if (since === null) return 0;
-        let cursor = this.db.mirror(this.subreddit).backfillCursor ?? this.now();
+        let cursor = this.db.mirror(this.key).backfillCursor ?? this.now();
         if (cursor <= since) return 0;
         if (!this.backfillPage.length) {
             this.backfillPage = await this.archives.arcticPosts(this.subreddit, since, cursor);
             if (!this.backfillPage.length) {
-                this.db.updateMirror(this.subreddit, { backfillCursor: since });
+                this.db.updateMirror(this.key, { backfillCursor: since });
                 this.log(`backfill from the archive done, back to ${new Date(since * 1000).toISOString()}`);
                 return 0;
             }
@@ -262,7 +279,7 @@ export class Mirror {
             // A post leaves the page only once it is dealt with: a failed thread fetch is retried on the next call
             while (looked < maxPosts && this.backfillPage.length) {
                 const post = this.backfillPage[0];
-                const wanted = !this.db.get(this.subreddit, post.redditId) && !(post.score !== null && post.score < this.config.minScore);
+                const wanted = !this.db.get(this.key, post.redditId) && !(post.score !== null && post.score < this.config.minScore);
                 if (wanted) {
                     const comments = await this.archives.arcticThread(post.redditId);
                     if (this.config.backfillOnly !== "removed" || removedWithText(post) || comments.some(removedWithText)) {
@@ -276,7 +293,7 @@ export class Mirror {
                 looked++;
             }
         } finally {
-            this.db.updateMirror(this.subreddit, { backfillCursor: cursor });
+            this.db.updateMirror(this.key, { backfillCursor: cursor });
         }
         if (added) this.log(`backfilled ${added} threads from the archive, now at ${new Date(cursor * 1000).toISOString()}`);
         return looked;
@@ -285,11 +302,16 @@ export class Mirror {
     private recordArchivedThread(post: Archived, comments: Archived[]): void {
         const now = this.now();
         this.db.transaction(() => {
-            // The archive hasn't re-read every item yet (it does so ~36 h after posting): the live checks take over
+            // The archive hasn't re-read every item yet (it does so ~36 h after posting): the live checks take over,
+            // unless there are none (archiveOnly), in which case the first read is all there is
             const unchecked = [post, ...comments].some((item) => item.recheckedOn === null);
             this.db.insert({
                 ...this.archivedItem(post, now),
-                nextCheckAt: unchecked ? now : nextCheckAt(post.createdUtc, now, this.config.commentUpdateDays)
+                nextCheckAt: this.config.archiveOnly
+                    ? null
+                    : unchecked
+                      ? now
+                      : nextCheckAt(post.createdUtc, now, this.config.commentUpdateDays)
             });
             // Parents are older than their replies, so in time order a parent is always known before its replies; one the
             // archive never saved leaves its replies hanging under the post, as the live path does
@@ -305,18 +327,18 @@ export class Mirror {
 
     // Arctic Shift's comment search, as a second feed for comments of posts we mirror
     async readArcticFeed(maxPages = 5): Promise<void> {
-        let cursor = this.db.mirror(this.subreddit).arcticCursor || this.now() - HOUR;
+        let cursor = this.db.mirror(this.key).arcticCursor || this.now() - HOUR;
         for (let page = 0; page < maxPages; page++) {
             const comments = await this.archives.arcticComments(this.subreddit, cursor);
             const now = this.now();
             this.db.transaction(() => {
                 for (const comment of comments) {
-                    if (!this.db.get(this.subreddit, comment.postId)) continue;
-                    const known = this.db.get(this.subreddit, comment.redditId);
+                    if (!this.db.get(this.key, comment.postId)) continue;
+                    const known = this.db.get(this.key, comment.redditId);
                     // Its snapshot is older than our own reads: it may only fill in text we lack
                     if (known) {
                         if (known.body === null && comment.body !== null)
-                            this.db.update(this.subreddit, known.redditId, {
+                            this.db.update(this.key, known.redditId, {
                                 body: comment.body,
                                 ...(known.publishStatus === "published" ? { publishedLabel: null } : {})
                             });
@@ -326,14 +348,14 @@ export class Mirror {
                 }
             });
             if (comments.length) cursor = Math.max(cursor, ...comments.map((c) => c.createdUtc));
-            this.db.updateMirror(this.subreddit, { arcticCursor: cursor });
+            this.db.updateMirror(this.key, { arcticCursor: cursor });
             if (comments.length < 100) break;
         }
     }
 
     // Text for items that vanished before we saved it: Arctic Shift first, PullPush for what it lacks
     async fillMissingText(limit = 100): Promise<void> {
-        const items = this.db.missingText(this.subreddit, MAX_TEXT_LOOKUPS, limit).filter((i) => isRedditId(i.redditId));
+        const items = this.db.missingText(this.key, MAX_TEXT_LOOKUPS, limit).filter((i) => isRedditId(i.redditId));
         if (!items.length) return;
         const ids = items.map((i) => i.redditId);
         const wanted = new Set(ids);
@@ -353,7 +375,7 @@ export class Mirror {
                     if (item.title === null && o.title) changes.title = o.title;
                     if (item.publishStatus === "published") changes.publishedLabel = null;
                 }
-                this.db.update(this.subreddit, item.redditId, changes);
+                this.db.update(this.key, item.redditId, changes);
             }
         });
         if (found.size) this.log(`recovered the text of ${found.size} removed items from archives`);
@@ -363,14 +385,14 @@ export class Mirror {
     async labelGoneComments(limit = 500): Promise<void> {
         const now = this.now();
         const items = this.db
-            .unlabelledGone(this.subreddit, now - ARCTIC_RECHECK_AGE, MAX_LABEL_LOOKUPS, now - LABEL_LOOKUP_SPACING, limit)
+            .unlabelledGone(this.key, now - ARCTIC_RECHECK_AGE, MAX_LABEL_LOOKUPS, now - LABEL_LOOKUP_SPACING, limit)
             .filter((i) => isRedditId(i.redditId));
         if (!items.length) return;
         const labels = await this.archives.arcticLabels(items.map((i) => i.redditId));
         this.db.transaction(() => {
             for (const item of items) {
                 const label = labels.get(item.redditId);
-                this.db.update(this.subreddit, item.redditId, {
+                this.db.update(this.key, item.redditId, {
                     labelLookups: item.labelLookups + 1,
                     labelCheckedAt: now,
                     ...(label === "deleted"
@@ -395,9 +417,9 @@ export class Mirror {
         let published = 0;
         // Re-queried after each batch: a reply becomes publishable once its parent went out in the batch before
         for (
-            let batch = this.db.publishable(this.subreddit, limit);
+            let batch = this.db.publishable(this.key, limit, this.publishFilter);
             batch.length && published < limit;
-            batch = this.db.publishable(this.subreddit, limit - published)
+            batch = this.db.publishable(this.key, limit - published, this.publishFilter)
         ) {
             const n = await this.publishBatch(batch);
             if (!n) break;
@@ -414,9 +436,9 @@ export class Mirror {
                 item.kind === "comment" &&
                 cap !== null &&
                 !isGone(item.status) &&
-                this.db.publishedCommentCount(this.subreddit, item.postId) >= cap
+                this.db.publishedCommentCount(this.key, item.postId) >= cap
             ) {
-                this.db.update(this.subreddit, item.redditId, { publishStatus: "failed", publishError: OVER_CAP });
+                this.db.update(this.key, item.redditId, { publishStatus: "failed", publishError: OVER_CAP });
                 continue;
             }
             const comment: NewComment = { content: this.contentFor(item), author: mirroredAuthor(item) };
@@ -427,12 +449,12 @@ export class Mirror {
                 const parent = this.publishedParent(item);
                 if (!parent) continue;
                 comment.parentCid = parent;
-                comment.postCid = this.db.get(this.subreddit, item.postId)!.cid!;
+                comment.postCid = this.db.get(this.key, item.postId)!.cid!;
             }
             try {
                 const cid = await this.publisher.comment(comment);
                 // An item that was already gone still needs its flair; the label step adds it
-                this.db.update(this.subreddit, item.redditId, {
+                this.db.update(this.key, item.redditId, {
                     cid,
                     publishStatus: "published",
                     publishedLabel: item.status === "up" ? labelOf(item) : null
@@ -441,17 +463,18 @@ export class Mirror {
                 await this.ensureAuthorFlair(cid);
             } catch (error) {
                 if (!(error instanceof PublishRejected)) throw error;
-                this.db.update(this.subreddit, item.redditId, { publishStatus: "failed", publishError: error.message });
+                this.db.update(this.key, item.redditId, { publishStatus: "failed", publishError: error.message });
                 this.log(`${item.redditId} rejected: ${error.message}`);
             }
         }
         return published;
     }
 
-    // The cid a reply goes under: its parent's, or with the parent skipped, the nearest mirrored ancestor's
+    // The cid a reply goes under: its parent's, or with the parent skipped (or, on a removed-only mirror, not wanted),
+    // the nearest published ancestor's
     private publishedParent(item: Item): string | null {
-        let parent = this.db.get(this.subreddit, item.parentId!)!;
-        while (parent.publishStatus === "skipped") parent = this.db.get(this.subreddit, parent.parentId ?? parent.postId)!;
+        let parent = this.db.get(this.key, item.parentId!)!;
+        while (!parent.cid && parent.kind === "comment") parent = this.db.get(this.key, parent.parentId ?? parent.postId)!;
         return parent.cid;
     }
 
@@ -459,38 +482,70 @@ export class Mirror {
     // reply tree, and the replies are published again under the nearest mirrored ancestor.
     async skipAuthors(): Promise<number> {
         let purged = 0;
-        for (const item of this.db.unskipped(this.subreddit, this.config.skipAuthors)) {
+        for (const item of this.db.unskipped(this.key, this.config.skipAuthors)) {
             if (item.cid) {
                 await this.publisher.moderate(item.cid, { purged: true, reason: `Comments by u/${item.author} aren't mirrored` });
                 purged++;
             }
             this.db.transaction(() => {
-                this.db.update(this.subreddit, item.redditId, {
+                this.db.update(this.key, item.redditId, {
                     publishStatus: "skipped",
                     cid: null,
                     publishedLabel: null,
                     publishError: null
                 });
                 if (item.cid)
-                    for (const reply of this.db.replyTree(this.subreddit, item.redditId))
+                    for (const reply of this.db.replyTree(this.key, item.redditId))
                         if (reply.publishStatus === "published")
-                            this.db.update(this.subreddit, reply.redditId, { publishStatus: "pending", cid: null, publishedLabel: null });
+                            this.db.update(this.key, reply.redditId, { publishStatus: "pending", cid: null, publishedLabel: null });
             });
         }
         if (purged) this.log(`purged ${purged} comments by skipped authors`);
         return purged;
     }
 
+    // Keeps one pinned bot reply per thread with removed replies up to date (threadSummary): published once, pinned,
+    // then edited whenever what it would say changes. Returns how many were published or edited.
+    async updateSummaries(limit = 100): Promise<number> {
+        if (!this.config.threadSummary) return 0;
+        let done = 0;
+        for (const post of this.db.postsForSummary(this.key)) {
+            if (done >= limit) break;
+            const text = threadSummary(post, this.db.commentsOf(this.key, post.redditId), (cid) => this.publisher.url(cid));
+            if (text === post.summaryText) continue;
+            try {
+                if (post.summaryCid) await this.publisher.edit(post.summaryCid, text);
+                else {
+                    const cid = await this.publisher.comment({
+                        content: text,
+                        author: { displayName: `r/${this.subreddit} mirror` },
+                        parentCid: post.cid!,
+                        postCid: post.cid!
+                    });
+                    this.db.update(this.key, post.redditId, { summaryCid: cid });
+                    await this.publisher.moderate(cid, { pinned: true });
+                }
+            } catch (error) {
+                if (!(error instanceof PublishRejected)) throw error;
+                this.log(`summary of ${post.redditId} rejected: ${error.message}`);
+            }
+            this.db.update(this.key, post.redditId, { summaryText: text });
+            done++;
+        }
+        if (done) this.log(`updated the removal summary of ${done} threads`);
+        return done;
+    }
+
     private async ensureAuthorFlair(cid: string): Promise<void> {
-        if (this.db.mirror(this.subreddit).authorFlairSet) return;
+        if (this.db.mirror(this.key).authorFlairSet) return;
         await this.publisher.moderate(cid, { author: { flairs: [MIRROR_AUTHOR_FLAIR] } });
-        this.db.updateMirror(this.subreddit, { authorFlairSet: 1 });
+        this.db.updateMirror(this.key, { authorFlairSet: 1 });
     }
 
     // Brings each published item's flair and note in line with what the checks found
     async publishLabels(limit: number): Promise<number> {
         let done = 0;
-        for (const item of this.db.labelsToPublish(this.subreddit, limit)) {
+        for (const item of this.db.labelsToPublish(this.key, limit)) {
             const flair = statusFlair(item);
             try {
                 if (item.publishedLabel === null || item.publishedLabel.split(":")[0] !== "up" || flair)
@@ -500,7 +555,7 @@ export class Mirror {
                 if (!(error instanceof PublishRejected)) throw error;
                 this.log(`label of ${item.redditId} rejected: ${error.message}`);
             }
-            this.db.update(this.subreddit, item.redditId, { publishedLabel: labelOf(item) });
+            this.db.update(this.key, item.redditId, { publishedLabel: labelOf(item) });
             done++;
         }
         return done;

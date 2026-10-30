@@ -13,7 +13,8 @@ export type PublishStatus = "pending" | "published" | "failed" | "skipped";
 export type ItemOrigin = "live" | "archive";
 
 export interface Item {
-    subreddit: string;
+    // The mirror's name (config `name`, the subreddit by default): two mirrors of one subreddit keep separate state
+    mirror: string;
     // With its t1_/t3_ prefix; no fixed length
     redditId: string;
     kind: ItemKind;
@@ -50,10 +51,13 @@ export interface Item {
     // The label already shown on the community (flair and note), "<status>:<removedBy>", so changes go out once
     publishedLabel: string | null;
     origin: ItemOrigin;
+    // Posts only: the bot's pinned reply that lists the thread's removed replies, and the text it was last given
+    summaryCid: string | null;
+    summaryText: string | null;
 }
 
 export interface MirrorState {
-    subreddit: string;
+    name: string;
     communityAddress: string | null;
     // The bot's author flair is set by a moderation on one of its comments, once
     authorFlairSet: number;
@@ -66,9 +70,12 @@ export interface MirrorState {
 
 export const labelOf = (item: Pick<Item, "status" | "removedBy">) => `${item.status}:${item.removedBy ?? ""}`;
 
+// What a removed-only mirror publishes besides the removed items themselves (see README, Publish modes)
+export type PublishFilter = { context: "ancestors" | "post" } | null;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS items (
-    subreddit TEXT NOT NULL,
+    mirror TEXT NOT NULL,
     redditId TEXT NOT NULL,
     kind TEXT NOT NULL,
     postId TEXT NOT NULL,
@@ -94,13 +101,15 @@ CREATE TABLE IF NOT EXISTS items (
     publishError TEXT,
     publishedLabel TEXT,
     origin TEXT NOT NULL DEFAULT 'live',
-    PRIMARY KEY (subreddit, redditId)
+    summaryCid TEXT,
+    summaryText TEXT,
+    PRIMARY KEY (mirror, redditId)
 );
 CREATE INDEX IF NOT EXISTS items_next_check ON items (nextCheckAt) WHERE nextCheckAt IS NOT NULL;
-CREATE INDEX IF NOT EXISTS items_publish ON items (subreddit, publishStatus, createdUtc);
-CREATE INDEX IF NOT EXISTS items_post ON items (subreddit, postId);
+CREATE INDEX IF NOT EXISTS items_publish ON items (mirror, publishStatus, createdUtc);
+CREATE INDEX IF NOT EXISTS items_post ON items (mirror, postId);
 CREATE TABLE IF NOT EXISTS mirrors (
-    subreddit TEXT PRIMARY KEY,
+    name TEXT PRIMARY KEY,
     communityAddress TEXT,
     authorFlairSet INTEGER NOT NULL DEFAULT 0,
     arcticCursor INTEGER NOT NULL DEFAULT 0,
@@ -108,14 +117,23 @@ CREATE TABLE IF NOT EXISTS mirrors (
 );
 `;
 
+// The state was keyed by subreddit before mirrors got names; the key column keeps its values (a mirror's default
+// name is its subreddit) under the new name
+const RENAMES: [table: string, from: string, to: string][] = [
+    ["items", "subreddit", "mirror"],
+    ["mirrors", "subreddit", "name"]
+];
+
 // Columns added after the first release, for databases created before them
 const MIGRATIONS: [table: string, column: string, definition: string][] = [
     ["items", "origin", "TEXT NOT NULL DEFAULT 'live'"],
+    ["items", "summaryCid", "TEXT"],
+    ["items", "summaryText", "TEXT"],
     ["mirrors", "backfillCursor", "INTEGER"]
 ];
 
 const COLUMNS: (keyof Item)[] = [
-    "subreddit",
+    "mirror",
     "redditId",
     "kind",
     "postId",
@@ -140,7 +158,9 @@ const COLUMNS: (keyof Item)[] = [
     "publishStatus",
     "publishError",
     "publishedLabel",
-    "origin"
+    "origin",
+    "summaryCid",
+    "summaryText"
 ];
 
 export class StateDb {
@@ -151,159 +171,196 @@ export class StateDb {
         this.db = new Database(file);
         // WAL lets the daemon keep writing while it is read
         this.db.pragma("journal_mode = WAL");
+        const columns = (table: string) => (this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+        for (const [table, from, to] of RENAMES)
+            if (columns(table).includes(from)) this.db.exec(`ALTER TABLE ${table} RENAME COLUMN ${from} TO ${to}`);
         this.db.exec(SCHEMA);
-        for (const [table, column, definition] of MIGRATIONS) {
-            const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-            if (!columns.some((c) => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-        }
+        for (const [table, column, definition] of MIGRATIONS)
+            if (!columns(table).includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
 
     close() {
         this.db.close();
     }
 
-    get(subreddit: string, redditId: string): Item | undefined {
-        return this.db.prepare("SELECT * FROM items WHERE subreddit = ? AND redditId = ?").get(subreddit, redditId) as Item | undefined;
+    get(mirror: string, redditId: string): Item | undefined {
+        return this.db.prepare("SELECT * FROM items WHERE mirror = ? AND redditId = ?").get(mirror, redditId) as Item | undefined;
     }
 
     insert(item: Item): void {
         this.db.prepare(`INSERT INTO items (${COLUMNS.join(", ")}) VALUES (${COLUMNS.map((c) => "@" + c).join(", ")})`).run(item);
     }
 
-    update(subreddit: string, redditId: string, changes: Partial<Omit<Item, "subreddit" | "redditId">>): void {
+    update(mirror: string, redditId: string, changes: Partial<Omit<Item, "mirror" | "redditId">>): void {
         const keys = Object.keys(changes);
         if (!keys.length) return;
         this.db
-            .prepare(`UPDATE items SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE subreddit = @subreddit AND redditId = @redditId`)
-            .run({ ...changes, subreddit, redditId });
+            .prepare(`UPDATE items SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE mirror = @mirror AND redditId = @redditId`)
+            .run({ ...changes, mirror, redditId });
     }
 
     transaction<T>(fn: () => T): T {
         return this.db.transaction(fn)();
     }
 
-    duePosts(subreddit: string, now: number, limit: number): Item[] {
+    duePosts(mirror: string, now: number, limit: number): Item[] {
         return this.db
-            .prepare("SELECT * FROM items WHERE subreddit = ? AND kind = 'post' AND nextCheckAt <= ? ORDER BY nextCheckAt LIMIT ?")
-            .all(subreddit, now, limit) as Item[];
+            .prepare("SELECT * FROM items WHERE mirror = ? AND kind = 'post' AND nextCheckAt <= ? ORDER BY nextCheckAt LIMIT ?")
+            .all(mirror, now, limit) as Item[];
     }
 
-    commentsOf(subreddit: string, postId: string): Item[] {
-        return this.db
-            .prepare("SELECT * FROM items WHERE subreddit = ? AND postId = ? AND kind = 'comment'")
-            .all(subreddit, postId) as Item[];
+    commentsOf(mirror: string, postId: string): Item[] {
+        return this.db.prepare("SELECT * FROM items WHERE mirror = ? AND postId = ? AND kind = 'comment'").all(mirror, postId) as Item[];
     }
 
     // Pending items whose parent is already published (or that are posts). Live items oldest first, then backfilled ones
-    // newest first, so what happens on Reddit now never waits behind history, and history fills in from the present back
-    publishable(subreddit: string, limit: number): Item[] {
+    // newest first, so what happens on Reddit now never waits behind history, and history fills in from the present back.
+    // With a filter (publish "removed-only") only removed items and their context are offered: the post of each, and
+    // with context "ancestors" every comment between the post and a removed reply. A removed reply whose parent is
+    // not published hangs under its nearest published ancestor, so it only waits for its post.
+    publishable(mirror: string, limit: number, filter: PublishFilter = null): Item[] {
+        const order = "ORDER BY i.origin = 'archive', CASE WHEN i.origin = 'archive' THEN -i.createdUtc ELSE i.createdUtc END LIMIT ?";
+        if (!filter)
+            return this.db
+                .prepare(
+                    `SELECT i.* FROM items i
+                     LEFT JOIN items p ON p.mirror = i.mirror AND p.redditId = i.parentId
+                     WHERE i.mirror = ? AND i.publishStatus = 'pending'
+                       AND (i.kind = 'post' OR p.publishStatus IN ('published', 'skipped'))
+                     ${order}`
+                )
+                .all(mirror, limit) as Item[];
+        const ancestors =
+            filter.context === "ancestors"
+                ? "UNION SELECT i.parentId FROM items i JOIN wanted w ON i.redditId = w.redditId WHERE i.mirror = ? AND i.parentId IS NOT NULL"
+                : "UNION SELECT i.postId FROM items i JOIN wanted w ON i.redditId = w.redditId WHERE i.mirror = ?";
         return this.db
             .prepare(
-                `SELECT i.* FROM items i
-                 LEFT JOIN items p ON p.subreddit = i.subreddit AND p.redditId = i.parentId
-                 WHERE i.subreddit = ? AND i.publishStatus = 'pending'
-                   AND (i.kind = 'post' OR p.publishStatus IN ('published', 'skipped'))
-                 ORDER BY i.origin = 'archive', CASE WHEN i.origin = 'archive' THEN -i.createdUtc ELSE i.createdUtc END LIMIT ?`
+                `WITH RECURSIVE wanted(redditId) AS (
+                     SELECT redditId FROM items WHERE mirror = ? AND status = 'removed'
+                     ${ancestors}
+                 )
+                 SELECT i.* FROM items i
+                 JOIN wanted w ON w.redditId = i.redditId
+                 LEFT JOIN items p ON p.mirror = i.mirror AND p.redditId = i.parentId
+                 LEFT JOIN items post ON post.mirror = i.mirror AND post.redditId = i.postId
+                 WHERE i.mirror = ? AND i.publishStatus = 'pending'
+                   AND (i.kind = 'post'
+                        OR p.publishStatus IN ('published', 'skipped')
+                        OR (post.publishStatus = 'published' AND p.redditId NOT IN (SELECT redditId FROM wanted)))
+                 ${order}`
             )
-            .all(subreddit, limit) as Item[];
+            .all(mirror, mirror, mirror, limit) as Item[];
     }
 
     // Comments by these authors that aren't marked skipped yet
-    unskipped(subreddit: string, authors: string[]): Item[] {
+    unskipped(mirror: string, authors: string[]): Item[] {
         if (!authors.length) return [];
         return this.db
             .prepare(
-                `SELECT * FROM items WHERE subreddit = ? AND kind = 'comment' AND publishStatus != 'skipped'
+                `SELECT * FROM items WHERE mirror = ? AND kind = 'comment' AND publishStatus != 'skipped'
                    AND lower(author) IN (${authors.map(() => "?").join(", ")})`
             )
-            .all(subreddit, ...authors.map((a) => a.toLowerCase())) as Item[];
+            .all(mirror, ...authors.map((a) => a.toLowerCase())) as Item[];
     }
 
     // Every reply under an item, at any depth
-    replyTree(subreddit: string, redditId: string): Item[] {
+    replyTree(mirror: string, redditId: string): Item[] {
         return this.db
             .prepare(
                 `WITH RECURSIVE tree(redditId) AS (
-                     SELECT redditId FROM items WHERE subreddit = ? AND parentId = ?
-                     UNION SELECT i.redditId FROM items i JOIN tree t ON i.parentId = t.redditId WHERE i.subreddit = ?
+                     SELECT redditId FROM items WHERE mirror = ? AND parentId = ?
+                     UNION SELECT i.redditId FROM items i JOIN tree t ON i.parentId = t.redditId WHERE i.mirror = ?
                  )
-                 SELECT i.* FROM items i JOIN tree t ON i.redditId = t.redditId WHERE i.subreddit = ?`
+                 SELECT i.* FROM items i JOIN tree t ON i.redditId = t.redditId WHERE i.mirror = ?`
             )
-            .all(subreddit, redditId, subreddit, subreddit) as Item[];
+            .all(mirror, redditId, mirror, mirror) as Item[];
     }
 
-    publishedPosts(subreddit: string): Item[] {
+    publishedPosts(mirror: string): Item[] {
         return this.db
-            .prepare("SELECT * FROM items WHERE subreddit = ? AND kind = 'post' AND publishStatus = 'published' ORDER BY createdUtc")
-            .all(subreddit) as Item[];
+            .prepare("SELECT * FROM items WHERE mirror = ? AND kind = 'post' AND publishStatus = 'published' ORDER BY createdUtc")
+            .all(mirror) as Item[];
     }
 
-    // Puts a post and every published reply in its thread back in the publish queue, as if never published
-    unpublishThread(subreddit: string, postId: string): void {
+    // Published posts with a removed reply, or with a summary reply that may need to say there is none left
+    postsForSummary(mirror: string): Item[] {
+        return this.db
+            .prepare(
+                `SELECT * FROM items p WHERE p.mirror = ? AND p.kind = 'post' AND p.publishStatus = 'published'
+                   AND (p.summaryCid IS NOT NULL OR EXISTS (
+                       SELECT 1 FROM items c WHERE c.mirror = p.mirror AND c.postId = p.redditId AND c.kind = 'comment' AND c.status = 'removed'))
+                 ORDER BY p.createdUtc`
+            )
+            .all(mirror) as Item[];
+    }
+
+    // Puts a post and every published reply in its thread back in the publish queue, as if never published. The
+    // thread's summary reply went with the purge.
+    unpublishThread(mirror: string, postId: string): void {
         this.db
             .prepare(
-                "UPDATE items SET publishStatus = 'pending', cid = NULL, publishedLabel = NULL WHERE subreddit = ? AND postId = ? AND publishStatus = 'published'"
+                `UPDATE items SET publishStatus = 'pending', cid = NULL, publishedLabel = NULL, summaryCid = NULL, summaryText = NULL
+                 WHERE mirror = ? AND postId = ? AND publishStatus = 'published'`
             )
-            .run(subreddit, postId);
+            .run(mirror, postId);
     }
 
-    publishedCommentCount(subreddit: string, postId: string): number {
+    publishedCommentCount(mirror: string, postId: string): number {
         return (
             this.db
                 .prepare(
-                    "SELECT COUNT(*) AS n FROM items WHERE subreddit = ? AND postId = ? AND kind = 'comment' AND publishStatus = 'published'"
+                    "SELECT COUNT(*) AS n FROM items WHERE mirror = ? AND postId = ? AND kind = 'comment' AND publishStatus = 'published'"
                 )
-                .get(subreddit, postId) as { n: number }
+                .get(mirror, postId) as { n: number }
         ).n;
     }
 
     // Published items whose shown label lags behind what the checks found; an unconfirmed missing item waits
-    labelsToPublish(subreddit: string, limit: number): Item[] {
+    labelsToPublish(mirror: string, limit: number): Item[] {
         return this.db
             .prepare(
-                `SELECT * FROM items WHERE subreddit = ? AND publishStatus = 'published' AND status != 'missing'
+                `SELECT * FROM items WHERE mirror = ? AND publishStatus = 'published' AND status != 'missing'
                    AND publishedLabel IS NOT (status || ':' || COALESCE(removedBy, '')) ORDER BY createdUtc LIMIT ?`
             )
-            .all(subreddit, limit) as Item[];
+            .all(mirror, limit) as Item[];
     }
 
     // Comments that vanished without anyone saying who removed them, old enough for Arctic Shift's 36 h re-check,
     // asked about at most maxLookups times and not since checkedBefore
-    unlabelledGone(subreddit: string, createdBefore: number, maxLookups: number, checkedBefore: number, limit: number): Item[] {
+    unlabelledGone(mirror: string, createdBefore: number, maxLookups: number, checkedBefore: number, limit: number): Item[] {
         return this.db
             .prepare(
-                `SELECT * FROM items WHERE subreddit = ? AND kind = 'comment' AND status = 'removed' AND removedBy = 'gone'
+                `SELECT * FROM items WHERE mirror = ? AND kind = 'comment' AND status = 'removed' AND removedBy = 'gone'
                    AND createdUtc < ? AND labelLookups < ? AND (labelCheckedAt IS NULL OR labelCheckedAt < ?) LIMIT ?`
             )
-            .all(subreddit, createdBefore, maxLookups, checkedBefore, limit) as Item[];
+            .all(mirror, createdBefore, maxLookups, checkedBefore, limit) as Item[];
     }
 
-    missingText(subreddit: string, maxLookups: number, limit: number): Item[] {
+    missingText(mirror: string, maxLookups: number, limit: number): Item[] {
         return this.db
             .prepare(
-                `SELECT * FROM items WHERE subreddit = ? AND body IS NULL AND status IN ('removed', 'deleted') AND textLookups < ?
+                `SELECT * FROM items WHERE mirror = ? AND body IS NULL AND status IN ('removed', 'deleted') AND textLookups < ?
                  ORDER BY createdUtc DESC LIMIT ?`
             )
-            .all(subreddit, maxLookups, limit) as Item[];
+            .all(mirror, maxLookups, limit) as Item[];
     }
 
-    publishedForSortData(subreddit: string): Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy" | "goneSeenAt">[] {
+    publishedForSortData(mirror: string): Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy" | "goneSeenAt">[] {
         return this.db
-            .prepare("SELECT cid, score, createdUtc, status, removedBy, goneSeenAt FROM items WHERE subreddit = ? AND cid IS NOT NULL")
-            .all(subreddit) as Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy" | "goneSeenAt">[];
+            .prepare("SELECT cid, score, createdUtc, status, removedBy, goneSeenAt FROM items WHERE mirror = ? AND cid IS NOT NULL")
+            .all(mirror) as Pick<Item, "cid" | "score" | "createdUtc" | "status" | "removedBy" | "goneSeenAt">[];
     }
 
-    mirror(subreddit: string): MirrorState {
-        this.db.prepare("INSERT OR IGNORE INTO mirrors (subreddit) VALUES (?)").run(subreddit);
-        return this.db.prepare("SELECT * FROM mirrors WHERE subreddit = ?").get(subreddit) as MirrorState;
+    mirror(name: string): MirrorState {
+        this.db.prepare("INSERT OR IGNORE INTO mirrors (name) VALUES (?)").run(name);
+        return this.db.prepare("SELECT * FROM mirrors WHERE name = ?").get(name) as MirrorState;
     }
 
-    updateMirror(subreddit: string, changes: Partial<Omit<MirrorState, "subreddit">>): void {
-        this.mirror(subreddit);
+    updateMirror(name: string, changes: Partial<Omit<MirrorState, "name">>): void {
+        this.mirror(name);
         const keys = Object.keys(changes);
         if (!keys.length) return;
-        this.db
-            .prepare(`UPDATE mirrors SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE subreddit = @subreddit`)
-            .run({ ...changes, subreddit });
+        this.db.prepare(`UPDATE mirrors SET ${keys.map((k) => `${k} = @${k}`).join(", ")} WHERE name = @name`).run({ ...changes, name });
     }
 }

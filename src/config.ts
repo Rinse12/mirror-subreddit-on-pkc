@@ -11,6 +11,9 @@ const MirrorSchema = z
             .string()
             .trim()
             .regex(/^[A-Za-z0-9_]{2,21}$/, "a subreddit name without r/"),
+        // The key of the mirror's state in state.sqlite, the subreddit by default. Two mirrors of one subreddit (a full
+        // mirror and a removed-only one, say) need distinct names; renaming a mirror orphans its state.
+        name: z.string().trim().min(1).optional(),
         // An existing community hosted on the RPC node; left out, the daemon creates one on first run and keeps its
         // address in state.sqlite
         communityAddress: z.string().min(1).nullable().default(null),
@@ -30,6 +33,19 @@ const MirrorSchema = z
         // What the community serves as `hot`, the page Seedit opens on: Reddit's hot order, or only what Reddit removed
         // (the `flaired` filter), with Reddit's hot order moving to `mirrored-reddit-hot`
         hotSort: z.enum(["reddit-hot", "removed-only"]).default("reddit-hot"),
+        // "all": every captured item is published. "removed-only": only items Reddit removed, plus their context (the
+        // post, and with `context: "ancestors"` the comments between the post and a removed reply); the rest is
+        // captured but stays in the database
+        publish: z.enum(["all", "removed-only"]).default("all"),
+        // With publish "removed-only": "ancestors" publishes the not-removed parents of a removed reply so it sits in
+        // its place in the thread; "post" publishes only the post and hangs the removed reply directly under it
+        context: z.enum(["ancestors", "post"]).default("ancestors"),
+        // Keep one pinned bot reply per thread that lists the replies Reddit removed in it, with links to each; off by
+        // default, people come for the removed content itself
+        threadSummary: z.boolean().default(false),
+        // The subreddit can't be read live (banned, quarantined, private): everything comes from the backfill walk,
+        // which needs backfillSince, and no live source is asked
+        archiveOnly: z.boolean().default(false),
         // Mirror the subreddit's history from Arctic Shift back to this instant (ISO 8601 with time and zone, e.g.
         // "2026-01-01T00:00:00Z"); unset: no backfill
         backfillSince: z.iso.datetime({ offset: true }).nullable().default(null),
@@ -51,6 +67,8 @@ export const ConfigSchema = z
         nodeDir: z.string().startsWith("/").optional(),
         // Holds state.sqlite, the per-community sort data and the signers
         dataDir: z.string().min(1).default("data"),
+        // The web client that links in bot replies point at, as <clientUrl>/#/p/<community>/c/<cid>
+        clientUrl: z.url().default("https://seedit.app"),
         mirrors: z.array(MirrorSchema).min(1),
         backends: z
             .object({
@@ -92,10 +110,18 @@ export const ConfigSchema = z
                 path: ["nodeDir"],
                 message: "required with rpcSshHost: where the page sorts live on that machine"
             });
-        for (const key of ["subreddit", "communityAddress", "signerPath"] as const) {
+        config.mirrors.forEach((mirror, index) => {
+            if (mirror.archiveOnly && !mirror.backfillSince)
+                ctx.addIssue({
+                    code: "custom",
+                    path: ["mirrors", index, "backfillSince"],
+                    message: "required with archiveOnly: the walk from the archive is the only source"
+                });
+        });
+        for (const key of ["name", "communityAddress", "signerPath"] as const) {
             const seen = new Set<string>();
             config.mirrors.forEach((mirror, index) => {
-                const value = key === "subreddit" ? mirror[key].toLowerCase() : mirror[key];
+                const value = key === "name" ? (mirror.name ?? mirror.subreddit).toLowerCase() : mirror[key];
                 if (value === null) return;
                 if (seen.has(value)) ctx.addIssue({ code: "custom", path: ["mirrors", index, key], message: `duplicate ${key}` });
                 seen.add(value);
@@ -103,8 +129,8 @@ export const ConfigSchema = z
         }
     });
 
-export type Config = z.infer<typeof ConfigSchema>;
-export type MirrorConfig = Config["mirrors"][number];
+export type Config = Omit<z.infer<typeof ConfigSchema>, "mirrors"> & { mirrors: MirrorConfig[] };
+export type MirrorConfig = Omit<z.infer<typeof ConfigSchema>["mirrors"][number], "name"> & { name: string };
 
 export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
     const result = ConfigSchema.safeParse(raw);
@@ -117,7 +143,11 @@ export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
     return {
         ...config,
         dataDir: path.resolve(baseDir, config.dataDir),
-        mirrors: config.mirrors.map((mirror) => ({ ...mirror, signerPath: path.resolve(baseDir, mirror.signerPath) }))
+        mirrors: config.mirrors.map((mirror) => ({
+            ...mirror,
+            name: mirror.name ?? mirror.subreddit,
+            signerPath: path.resolve(baseDir, mirror.signerPath)
+        }))
     };
 }
 

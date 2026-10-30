@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { archiveNote, formatDuration, mirroredAuthor, mirroredContent, removalNote, statusFlair } from "../src/content.js";
+import {
+    archiveNote,
+    formatDuration,
+    mirroredAuthor,
+    mirroredContent,
+    removalNote,
+    statusFlair,
+    SUMMARY_LIST_LIMIT,
+    threadSummary
+} from "../src/content.js";
 
 const T = Date.UTC(2026, 9, 29, 11, 0, 0) / 1000;
 const item = {
@@ -59,6 +68,51 @@ describe("content", () => {
         expect(statusFlair({ ...item, status: "deleted" })).toEqual({ text: "Deleted by author on Reddit" });
         expect(statusFlair({ ...item, status: "locked" })).toEqual({ text: "Locked on Reddit" });
         expect(statusFlair({ ...item, status: "missing" })).toBeNull();
+    });
+
+    describe("thread summary", () => {
+        const url = (cid: string) => `https://seedit.app/#/p/c.bso/c/${cid}`;
+        const reply = (author: string, o: Partial<Parameters<typeof threadSummary>[1][number]> = {}) => ({
+            ...item,
+            kind: "comment" as const,
+            author,
+            cid: `Qm_${author}`,
+            ...o
+        });
+
+        it("counts the removed replies, says by whom, and links each mirrored copy, most recently removed first", () => {
+            const text = threadSummary(
+                { numComments: 230 },
+                [
+                    reply("first", { lastSeenUpAt: T + 1800, goneSeenAt: T + 3600, removedBy: "gone" }),
+                    reply("second", { lastSeenUpAt: T + 3600, goneSeenAt: T + 7200 }),
+                    reply("up", { status: "up", removedBy: null, goneSeenAt: null }),
+                    reply("gone_author", { status: "deleted", removedBy: "deleted" }),
+                    reply("lost", { cid: null, removedBy: "removed", lastSeenUpAt: T, goneSeenAt: T + 60 })
+                ],
+                url
+            );
+            expect(text).toBe(
+                [
+                    "**3 of 230 comments removed on Reddit so far** (1 by moderators, 1 removed or deleted, 1 by mods or admins). 1 more was deleted by their authors.",
+                    "",
+                    "- [u/second](https://seedit.app/#/p/c.bso/c/Qm_second): removed by moderators on Reddit between 2026-10-29 12:00 and 13:00 UTC, 1 h to 2 h after posting",
+                    "- [u/first](https://seedit.app/#/p/c.bso/c/Qm_first): removed or deleted on Reddit between 2026-10-29 11:30 and 12:00 UTC, 30 min to 1 h after posting",
+                    "- u/lost (not captured): removed on Reddit between 2026-10-29 11:00 and 11:01 UTC, within 1 min of posting"
+                ].join("\n")
+            );
+        });
+
+        it("names a single remover inline, counts what it doesn't list, and says when nothing is left", () => {
+            const many = Array.from({ length: SUMMARY_LIST_LIMIT + 3 }, (_, i) => reply(`a${i}`));
+            const text = threadSummary({ numComments: 10 }, many, url);
+            expect(text).toMatch(/^\*\*53 of 53 comments removed on Reddit so far\*\* \(by moderators\)\.\n\n- /);
+            expect(text.split("\n")).toHaveLength(2 + SUMMARY_LIST_LIMIT + 1);
+            expect(text).toMatch(/\n- and 3 more$/);
+            expect(threadSummary({ numComments: 5 }, [reply("up", { status: "up", removedBy: null })], url)).toBe(
+                "*No comment of this thread is removed on Reddit any more.*"
+            );
+        });
     });
 
     it("formats durations", () => {

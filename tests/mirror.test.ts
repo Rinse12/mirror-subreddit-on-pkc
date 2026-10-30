@@ -85,6 +85,9 @@ class FakePublisher implements Publisher {
     async moderate(cid: string, moderation: unknown) {
         this.calls.push(["moderate", cid, moderation]);
     }
+    url(cid: string) {
+        return `https://seedit.app/#/p/c.bso/c/${cid}`;
+    }
     of(kind: string) {
         return this.calls.filter((c) => c[0] === kind);
     }
@@ -386,6 +389,119 @@ describe("Mirror", () => {
         expect(db.get(SUB, POST)!.nextCheckAt).toBe(now + 600);
     });
 
+    describe("publish removed-only", () => {
+        // post > a (up) > b (removed) > c (up); d (up) under the post
+        const thread = () => [
+            comment("t1_a", POST),
+            comment("t1_b", "t1_a", { createdUtc: T0 + 70 }),
+            comment("t1_c", "t1_b", { createdUtc: T0 + 80 }),
+            comment("t1_d", POST, { createdUtc: T0 + 90 })
+        ];
+        const authors = () => publisher.of("comment").map((c) => (c[1] as { author: { displayName: string } }).author.displayName);
+
+        it("publishes nothing until something is removed, then the removed reply with the parents above it", async () => {
+            const m = mirror(archives(), { publish: "removed-only" });
+            await mirrorThread(m, thread());
+            expect(publisher.calls).toEqual([]);
+            now = T0 + 3600;
+            source.thread = { post: post(), comments: [comment("t1_a", POST), comment("t1_c", "t1_b"), comment("t1_d", POST)] };
+            await m.checkThread(db.get(SUB, POST)!);
+            await m.publishPending(50);
+            expect(authors()).toEqual(["u/asker", "u/author_t1_a", "u/author_t1_b"]);
+            expect(db.get(SUB, "t1_b")!.cid).toBe("Qm3");
+            expect((publisher.of("comment")[2][1] as { parentCid: string }).parentCid).toBe("Qm2");
+            await m.publishLabels(50);
+            expect(publisher.of("moderate").at(-1)).toEqual(["moderate", "Qm3", { flairs: [{ text: "Removed or deleted on Reddit" }] }]);
+            // c and d stay captured, unpublished
+            expect(db.get(SUB, "t1_c")).toMatchObject({ publishStatus: "pending", cid: null });
+            expect(db.get(SUB, "t1_d")).toMatchObject({ publishStatus: "pending", cid: null });
+        });
+
+        it("with context post hangs the removed reply under the post", async () => {
+            const m = mirror(archives(), { publish: "removed-only", context: "post" });
+            await mirrorThread(m, thread());
+            source.thread = { post: post(), comments: [comment("t1_a", POST), comment("t1_c", "t1_b"), comment("t1_d", POST)] };
+            await m.checkThread(db.get(SUB, POST)!);
+            await m.publishPending(50);
+            expect(authors()).toEqual(["u/asker", "u/author_t1_b"]);
+            expect((publisher.of("comment")[1][1] as { parentCid: string }).parentCid).toBe("Qm1");
+        });
+
+        it("treats a restored reply as an ordinary comment, kept with its flair cleared", async () => {
+            const m = mirror(archives(), { publish: "removed-only" });
+            await mirrorThread(m, thread());
+            source.thread = { post: post(), comments: [comment("t1_a", POST), comment("t1_c", "t1_b"), comment("t1_d", POST)] };
+            await m.checkThread(db.get(SUB, POST)!);
+            await m.publishPending(50);
+            await m.publishLabels(50);
+            publisher.calls = [];
+            source.thread = { post: post(), comments: thread() };
+            await m.checkThread(db.get(SUB, POST)!);
+            await m.publishLabels(50);
+            expect(publisher.calls).toEqual([
+                ["moderate", "Qm3", { flairs: [] }],
+                ["edit", "Qm3", "text of t1_b"]
+            ]);
+            expect(db.get(SUB, "t1_b")).toMatchObject({ status: "up", publishStatus: "published", cid: "Qm3" });
+        });
+
+        it("publishes a removed post on its own, and keeps a separately named mirror's state apart", async () => {
+            const m = mirror(archives(), { name: "ah-removed", publish: "removed-only" });
+            source.posts = [post({ status: "removed", removedBy: "moderator", body: null })];
+            source.thread = { post: source.posts[0], comments: [] };
+            await m.discoverPosts();
+            await m.publishPending(50);
+            expect(publisher.of("comment")).toHaveLength(1);
+            expect(db.get("ah-removed", POST)).toMatchObject({ mirror: "ah-removed", publishStatus: "published" });
+            expect(db.get(SUB, POST)).toBeUndefined();
+        });
+    });
+
+    describe("thread summary", () => {
+        it("keeps one pinned bot reply per thread with removed replies up to date, only when enabled", async () => {
+            const off = mirror();
+            await mirrorThread(off, [comment("t1_a", POST), comment("t1_b", POST, { createdUtc: T0 + 70 })]);
+            source.thread = { post: post(), comments: [comment("t1_b", POST, { createdUtc: T0 + 70 })] };
+            now = T0 + 3600;
+            await off.checkThread(db.get(SUB, POST)!);
+            expect(await off.updateSummaries()).toBe(0);
+            publisher.calls = [];
+
+            const m = mirror(archives(), { threadSummary: true });
+            expect(await m.updateSummaries()).toBe(1);
+            expect(publisher.calls).toEqual([
+                [
+                    "comment",
+                    {
+                        content:
+                            "**1 of 2 comments removed on Reddit so far** (removed or deleted).\n\n- [u/author_t1_a](https://seedit.app/#/p/c.bso/c/Qm2): removed or deleted on Reddit between 2026-10-29 12:02 and 13:00 UTC, 1 min to 59 min after posting",
+                        author: { displayName: "r/AskHistorians mirror" },
+                        parentCid: "Qm1",
+                        postCid: "Qm1"
+                    }
+                ],
+                ["moderate", "Qm4", { pinned: true }]
+            ]);
+            expect(db.get(SUB, POST)).toMatchObject({ summaryCid: "Qm4" });
+            // Nothing changed: nothing published
+            expect(await m.updateSummaries()).toBe(0);
+            // The remover becomes known: the text changes, so the reply is edited
+            db.update(SUB, "t1_a", { removedBy: "moderator" });
+            publisher.calls = [];
+            expect(await m.updateSummaries()).toBe(1);
+            expect(publisher.calls).toEqual([
+                ["edit", "Qm4", expect.stringMatching(/^\*\*1 of 2 comments removed on Reddit so far\*\* \(by moderators\)/)]
+            ]);
+            // Restored: the reply says so instead of vanishing
+            source.thread = { post: post(), comments: [comment("t1_a", POST), comment("t1_b", POST, { createdUtc: T0 + 70 })] };
+            await m.checkThread(db.get(SUB, POST)!);
+            publisher.calls = [];
+            expect(await m.updateSummaries()).toBe(1);
+            expect(publisher.calls).toEqual([["edit", "Qm4", "*No comment of this thread is removed on Reddit any more.*"]]);
+            expect(await m.updateSummaries()).toBe(0);
+        });
+    });
+
     describe("backfill", () => {
         const DAY = 86400;
         const SINCE = "2026-10-01T00:00:00Z";
@@ -488,7 +604,7 @@ describe("Mirror", () => {
             expect(db.get(SUB, "t1_kept")).toBeUndefined();
         });
 
-        it("hands a thread the archive hasn't re-read yet to the live checks, and respects minScore", async () => {
+        it("hands a thread the archive hasn't re-read yet to the live checks, unless the mirror is archive-only, and respects minScore", async () => {
             const fresh = archived(post({ redditId: "t3_fresh", postId: "t3_fresh", createdUtc: T0 - 3600, score: 1 }), {
                 recheckedOn: null
             });
@@ -496,6 +612,11 @@ describe("Mirror", () => {
             now = T0;
             await m.backfill(5);
             expect(db.get(SUB, "t3_fresh")).toMatchObject({ origin: "archive", nextCheckAt: T0, lastSeenUpAt: fresh.retrievedOn });
+
+            db.close();
+            db = new StateDb(":memory:");
+            await mirror(archive([fresh]), { backfillSince: SINCE, archiveOnly: true }).backfill(5);
+            expect(db.get(SUB, "t3_fresh")).toMatchObject({ origin: "archive", nextCheckAt: null });
 
             db.close();
             db = new StateDb(":memory:");

@@ -13,18 +13,18 @@ const tunnel = config.rpcSshHost ? await openRpcTunnel(config.rpcSshHost, config
 const pkc = await createPkc(tunnel?.rpcUrl ?? config.rpcUrl);
 try {
     for (const mirror of config.mirrors) {
-        const address = mirror.communityAddress ?? db.mirror(mirror.subreddit).communityAddress;
+        const address = mirror.communityAddress ?? db.mirror(mirror.name).communityAddress;
         if (!address) continue;
         const signer = await loadSigner(pkc, mirror.signerPath);
-        const posts = db.publishedPosts(mirror.subreddit);
+        const posts = db.publishedPosts(mirror.name);
         for (const [i, post] of posts.entries()) {
             await publishModeration(pkc, signer, address, post.cid!, { purged: true, reason: "Republished in a new format" });
             db.transaction(() => {
-                db.unpublishThread(mirror.subreddit, post.redditId);
+                db.unpublishThread(mirror.name, post.redditId);
                 // The bot's author flair is a moderation on its first published item, which may be this one
-                db.updateMirror(mirror.subreddit, { authorFlairSet: 0 });
+                db.updateMirror(mirror.name, { authorFlairSet: 0 });
             });
-            console.log(`r/${mirror.subreddit}: purged ${i + 1}/${posts.length} ${post.redditId}`);
+            console.log(`${mirror.name}: purged ${i + 1}/${posts.length} ${post.redditId}`);
         }
     }
 } finally {
