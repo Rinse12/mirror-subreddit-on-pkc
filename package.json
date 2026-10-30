@@ -1,0 +1,36 @@
+{
+    "name": "pkc-community-mirroring-subreddit",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Mirrors subreddits onto Bitsocial communities and records when Reddit removes posts and comments",
+    "type": "module",
+    "engines": {
+        "node": ">=22"
+    },
+    "scripts": {
+        "start": "tsx src/daemon.ts",
+        "create-signer": "tsx scripts/create-signer.ts",
+        "republish": "tsx scripts/republish.ts",
+        "test": "vitest run",
+        "type-check": "tsc -p tsconfig.json --noEmit",
+        "format": "prettier --write .",
+        "format:check": "prettier --check .",
+        "dry-run": "DRY_RUN=1 tsx src/daemon.ts"
+    },
+    "dependencies": {
+        "@pkcprotocol/pkc-js": "0.0.127",
+        "better-sqlite3": "12.9.0",
+        "cheerio": "1.2.0",
+        "tsx": "4.23.15",
+        "turndown": "7.2.4",
+        "zod": "4.3.5"
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "7.6.13",
+        "@types/node": "22.20.5",
+        "@types/turndown": "5.0.6",
+        "prettier": "3.8.1",
+        "typescript": "7.0.2",
+        "vitest": "4.1.10"
+    }
+}

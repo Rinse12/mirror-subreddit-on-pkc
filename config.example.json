@@ -1,0 +1,20 @@
+{
+    "rpcUrl": "ws://localhost:9138",
+    "mirrors": [
+        {
+            "subreddit": "AskScience",
+            "signerPath": "data/signers/askscience.json",
+            "commentUpdateDays": 7,
+            "minScore": 0,
+            "authorDeleted": "hide",
+            "maxCommentsPerPost": null,
+            "skipAuthors": ["AutoModerator"]
+        }
+    ],
+    "backends": {
+        "redlib": { "instances": ["http://localhost:8080"] },
+        "reddit-json": { "userAgent": "pkc-mirror/0.1" },
+        "arctic-shift": { "baseUrl": "https://arctic-shift.photon-reddit.com" },
+        "pullpush": { "baseUrl": "https://api.pullpush.io" }
+    }
+}

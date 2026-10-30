@@ -1,0 +1,17 @@
+[Unit]
+Description=Mirror subreddits onto Bitsocial communities
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# repo location; adjust to this machine
+WorkingDirectory=%h/pkc_community_mirroring_subreddit
+# node from nvm; adjust to this machine
+Environment=PATH=%h/.nvm/versions/node/v22.22.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.nvm/versions/node/v22.22.0/bin/npm run --silent start
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

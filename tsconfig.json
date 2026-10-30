@@ -1,0 +1,10 @@
+{
+    "extends": "./tsconfig.base.json",
+    "compilerOptions": {
+        "noEmit": true,
+        "allowImportingTsExtensions": false,
+        // sorts/ is plain JS the community node imports; type-checked loosely through inference
+        "allowJs": true
+    },
+    "include": ["src", "scripts", "tests", "sorts"]
+}
