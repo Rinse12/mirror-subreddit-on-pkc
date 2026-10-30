@@ -140,7 +140,7 @@ The core feature, and it applies to **mirrored replies as much as to mirrored po
 **Re-checks.** Every mirrored post and reply is re-checked on a schedule that slows down with age: every 10 min for the first 6 h, hourly until day 2, then daily until `commentUpdateDays`.
 
 - Re-checks use Reddit's batched lookup by ID (`/api/info`, 100 IDs per request) when it is reachable.
-- Otherwise the thread is re-read through Redlib, following its "More replies" links. Redlib leaves removed and author-deleted comments out entirely, with no `[removed]` marker. A reply gone from the thread page is recorded as **`missing`**, and its own permalink is then loaded: if the comment isn't there either, it is gone. A comment that is only collapsed is never flaired.
+- Otherwise the thread is re-read through Redlib, following its "More replies" links. Redlib leaves a removed or author-deleted comment out entirely when nothing was posted under it, with no `[removed]` marker; one that still has replies stays in the tree as a tombstone (`[removed] — view removed comment`, author `u/[deleted]`), which the parser reads as removed or deleted. A reply gone from the thread page is recorded as **`missing`**, and its own permalink is then loaded: if the comment isn't there either, it is gone. A comment that is only collapsed is never flaired.
 
 For each item it records:
 

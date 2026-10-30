@@ -121,7 +121,9 @@ function parseComment($: cheerio.CheerioAPI, el: Element, postId: string): Obser
     const parentComment = comment.parent().closest("div.comment");
     const md = comment.find("> .comment_right > .comment_body > .md").first();
     const text = md.text().trim();
-    const status: ObservedStatus = text === "[removed]" ? "removed" : text === "[deleted]" ? "deleted" : "up";
+    // A removed or deleted comment that still has replies stays in the tree as a tombstone, rendered as
+    // "[removed] — view removed comment" (an undelete link follows the placeholder); one without replies is left out
+    const status: ObservedStatus = text.startsWith("[removed]") ? "removed" : text.startsWith("[deleted]") ? "deleted" : "up";
     return {
         redditId: `t1_${comment.attr("id")}`,
         kind: "comment",
@@ -194,7 +196,8 @@ export function parseListingPage(html: string): ListingPage {
     return { posts, next };
 }
 
-// The comment's own page shows the comment if it is up; a removed or deleted one is simply absent
+// The comment's own page shows the comment if it is up, as a tombstone if it is gone but has replies, and not at all
+// if it is gone without replies
 export function parsePermalinkPage(html: string, commentId: string): Observed | null | undefined {
     const $ = cheerio.load(html);
     const post = $("div.post.highlighted").first();

@@ -69,6 +69,13 @@ describe("parseThreadPage", () => {
         expect(comments.map((c) => c.redditId)).toEqual(["t1_pewbwug"]);
     });
 
+    it("keeps a removed comment that still has replies as a tombstone, with its replies under it", () => {
+        const { comments } = parseThreadPage(fixture("permalink-removed-parent.html"));
+        const removed = comments.find((c) => c.redditId === "t1_19ruykr495yg3")!;
+        expect(removed).toMatchObject({ status: "removed", removedBy: "removed", body: null, author: "[deleted]", score: 3 });
+        expect(comments.find((c) => c.redditId === "t1_19ruyr7k9rdlu")).toMatchObject({ parentId: "t1_19ruykr495yg3", status: "up" });
+    });
+
     it("recognizes removed posts", () => {
         expect(parseThreadPage(fixture("post-removed-by-moderator.html")).post).toMatchObject({
             status: "removed",
@@ -101,6 +108,10 @@ describe("parsePermalinkPage", () => {
     it("returns the comment when up and null when gone", () => {
         expect(parsePermalinkPage(fixture("permalink-visible-comment.html"), "t1_pewbwug")?.redditId).toBe("t1_pewbwug");
         expect(parsePermalinkPage(fixture("permalink-removed-comment.html"), "t1_pey92h4")).toBeNull();
+        expect(parsePermalinkPage(fixture("permalink-removed-parent.html"), "t1_19ruykr495yg3")).toMatchObject({
+            status: "removed",
+            body: null
+        });
         expect(parsePermalinkPage("<title>Error</title>", "t1_x")).toBeUndefined();
     });
 });
