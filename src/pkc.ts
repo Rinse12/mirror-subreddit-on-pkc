@@ -162,7 +162,7 @@ export function pageSettings(sortDataFile: string, sortsDir = SORTS_DIR, hotSort
         posts: [
             ...(hotSort === "removed-only"
                 ? [
-                      sortEntry(sortsDir, "flaired-hot.js", sortDataFile, true, { order: "hot", decay: "3d" }),
+                      sortEntry(sortsDir, "flaired-hot.js", sortDataFile, true, { order: "hot" }),
                       sortEntry(sortsDir, "flaired.js", sortDataFile, false, flairedOptions),
                       sortEntry(sortsDir, "mirrored-reddit-hot.js", sortDataFile, false, { nativeWeight: "1" })
                   ]

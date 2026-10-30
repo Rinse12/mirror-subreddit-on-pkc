@@ -76,7 +76,7 @@ describe("pageSettings", () => {
             ["removed-first.js", false],
             ["active", "built-in"]
         ]);
-        expect(files(pages.posts)[0].options).toEqual({ sortDataPath: FILE, order: "hot", decay: "3d" });
+        expect(files(pages.posts)[0].options).toEqual({ sortDataPath: FILE, order: "hot" });
         expect(files(pages.posts)[1].options).toEqual({ sortDataPath: FILE, order: "flaired" });
         expect(communityEdit({ settings: { challenges: [] } }, BOT, FILE, undefined, "removed-only")?.settings?.pages).toEqual(pages);
     });
