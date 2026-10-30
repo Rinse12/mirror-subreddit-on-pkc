@@ -200,6 +200,7 @@ With `backfillSince` set, the daemon also mirrors the subreddit's history from A
 
 ## TODO / later
 
+- **`hot` by comment count**: an `order` value for the `flaired` filter (and so for `hot` on a removed-only community) that ranks posts by how many comments sit under them, so the busiest removed threads come first. The posts variant already receives every descendant through `requireReplies`, so the count is there; decide whether it counts all replies or only the flaired ones, and whether native replies count.
 - **A removed-only community** (a publish mode that only ever receives removed items and their context) is the follow-up if the `flaired` view turns out too weak. It needs the state keyed per mirror rather than per subreddit, a setting for publishing the not-removed parents of a removed reply, and a rule for items Reddit restores.
 - **Thread summary**: when replies inside a thread are removed, the bot keeps one pinned reply on the post up to date (`14 of 230 comments removed by mods on Reddit so far`, with links to each).
 - **Takedown command** for copyright or personal-data requests about a single mirrored item.
