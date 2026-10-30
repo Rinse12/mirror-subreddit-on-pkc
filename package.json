@@ -18,7 +18,7 @@
         "dry-run": "DRY_RUN=1 tsx src/daemon.ts"
     },
     "dependencies": {
-        "@pkcprotocol/pkc-js": "0.0.127",
+        "@pkcprotocol/pkc-js": "0.0.131",
         "better-sqlite3": "12.9.0",
         "cheerio": "1.2.0",
         "tsx": "4.23.15",

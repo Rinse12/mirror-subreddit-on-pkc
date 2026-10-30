@@ -9,7 +9,7 @@
 //
 // Replies: a flat page of the flaired replies in the thread, so a removed answer shows even when its parent is
 // up, in mirrored-reddit-best order.
-import { bestScore } from "./mirrored-reddit-best.js";
+import { bestScore } from "./reddit-best.js";
 import {
     entryOf,
     NATIVE_WEIGHT_OPTION,

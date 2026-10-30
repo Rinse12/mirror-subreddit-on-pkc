@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { communityEdit, pageSettings } from "../src/pkc.js";
+import { communityEdit, hostedAddresses, pageSettings } from "../src/pkc.js";
 
 const BOT = "12D3KooWBot";
 const FILE = "/srv/mirror/data/sort-data/c.json";
@@ -91,5 +91,18 @@ describe("pageSettings on a remote node", () => {
             "/root/subreddit-mirror/sorts/mirrored-reddit-best.js",
             "/root/subreddit-mirror/sorts/flaired-replies.js"
         ]);
+    });
+});
+
+describe("hostedAddresses", () => {
+    it("reads the RPC's community list as strings or as the objects newer pkc-js sends", () => {
+        expect(hostedAddresses(["12D3KooWA"])).toEqual(["12D3KooWA"]);
+        expect(
+            hostedAddresses([
+                { publicKey: "12D3KooWB", started: true },
+                { name: "memes.bso", publicKey: "12D3KooWC", started: false }
+            ])
+        ).toEqual(["12D3KooWB", "12D3KooWC", "memes.bso"]);
+        expect(hostedAddresses(undefined)).toEqual([]);
     });
 });

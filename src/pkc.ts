@@ -211,10 +211,21 @@ export function communityEdit(
     return changed ? { roles, settings } : null;
 }
 
+// The addresses in the RPC server's list of hosted communities: plain strings on older pkc-js, `{ publicKey, name?,
+// started }` entries since 0.0.129 (a community with a domain name is listed under its key as well)
+export function hostedAddresses(communities: unknown): string[] {
+    if (!Array.isArray(communities)) return [];
+    return communities.flatMap((entry) => {
+        if (typeof entry === "string") return [entry];
+        const { publicKey, address, name } = (entry ?? {}) as { publicKey?: unknown; address?: unknown; name?: unknown };
+        return [publicKey, address, name].filter((value): value is string => typeof value === "string");
+    });
+}
+
 // Waits for the RPC server's list of the communities it hosts
 async function hostedCommunities(pkc: PkcInstance): Promise<string[]> {
     for (let i = 0; i < 50 && !pkc.communities?.length; i++) await new Promise((resolve) => setTimeout(resolve, 200));
-    return pkc.communities ?? [];
+    return hostedAddresses(pkc.communities);
 }
 
 // Opens the mirror's community on the node, creating it when it has none yet, brings its roles and settings in
