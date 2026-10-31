@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +16,9 @@ export const SORTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url
 export const rpcLost = (error: unknown): boolean => (error as { code?: unknown } | null)?.code === "ERR_FAILED_TO_OPEN_CONNECTION_TO_RPC";
 
 export async function createPkc(rpcUrl: string, onRpcLost: (error: unknown) => void = () => {}): Promise<PkcInstance> {
+    // Every publication in flight listens for updates of the same community instance inside pkc-js; four at a time
+    // (PUBLISH_CONCURRENCY) plus the label edits cross Node's default of 10 and fill the journal with warnings
+    EventEmitter.defaultMaxListeners = 64;
     const pkc = await PKC({ pkcRpcClientsOptions: [rpcUrl] });
     // pkc-js has no default error listener; without one an unhandled 'error' would crash the process
     pkc.on("error", (error: unknown) => {
