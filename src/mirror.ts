@@ -60,6 +60,10 @@ const isGone = (status: Item["status"]) => status === "removed" || status === "d
 // kept), or a removed comment whose text the archive kept
 const removedWithText = (item: Archived) => item.status === "removed" && (item.kind === "post" || item.body !== null);
 
+// Publications of a batch in flight at once. Each waits about ten seconds for the community's verification, and the
+// items of a batch are independent: publishable offers a reply only once its parent is published.
+export const PUBLISH_CONCURRENCY = 4;
+
 // What the log prefix and the state key of a mirror look like: the subreddit, unless the mirror was named
 export const mirrorLabel = (config: Pick<MirrorConfig, "name" | "subreddit">) =>
     config.name === config.subreddit ? `r/${config.subreddit}` : config.name;
@@ -70,6 +74,8 @@ export class Mirror {
     readonly key: string;
     // The page of archived posts the backfill is working through, newest first
     private backfillPage: Archived[] = [];
+    // The author flair moderation under way, so parallel publications set it once
+    private authorFlair: Promise<void> | null = null;
 
     constructor(
         private readonly db: StateDb,
@@ -282,10 +288,11 @@ export class Mirror {
                 const wanted = !this.db.get(this.key, post.redditId) && !(post.score !== null && post.score < this.config.minScore);
                 if (wanted) {
                     const comments = await this.archives.arcticThread(post.redditId);
-                    if (this.config.backfillOnly !== "removed" || removedWithText(post) || comments.some(removedWithText)) {
-                        this.recordArchivedThread(post, comments);
+                    if (
+                        (this.config.backfillOnly !== "removed" || removedWithText(post) || comments.some(removedWithText)) &&
+                        this.recordArchivedThread(post, comments)
+                    )
                         added++;
-                    }
                 }
                 this.backfillPage.shift();
                 // Both search bounds are exclusive: the next page starts right below this post
@@ -299,9 +306,11 @@ export class Mirror {
         return looked;
     }
 
-    private recordArchivedThread(post: Archived, comments: Archived[]): void {
+    // False when the live path recorded the thread while its comments were being fetched: its copy wins
+    private recordArchivedThread(post: Archived, comments: Archived[]): boolean {
         const now = this.now();
-        this.db.transaction(() => {
+        return this.db.transaction(() => {
+            if (this.db.get(this.key, post.redditId)) return false;
             // The archive hasn't re-read every item yet (it does so ~36 h after posting): the live checks take over,
             // unless there are none (archiveOnly), in which case the first read is all there is
             const unchecked = [post, ...comments].some((item) => item.recheckedOn === null);
@@ -322,6 +331,7 @@ export class Mirror {
                 known.add(comment.redditId);
                 this.db.insert(this.archivedItem({ ...comment, parentId }, now));
             }
+            return true;
         });
     }
 
@@ -428,46 +438,71 @@ export class Mirror {
         return published;
     }
 
+    // PUBLISH_CONCURRENCY workers over the batch; an error other than a rejection stops the batch and is rethrown once
+    // the publications in flight are done
     private async publishBatch(items: Item[]): Promise<number> {
         let published = 0;
-        for (const item of items) {
-            const cap = this.config.maxCommentsPerPost;
-            if (
-                item.kind === "comment" &&
-                cap !== null &&
-                !isGone(item.status) &&
-                this.db.publishedCommentCount(this.key, item.postId) >= cap
-            ) {
-                this.db.update(this.key, item.redditId, { publishStatus: "failed", publishError: OVER_CAP });
-                continue;
+        const queue = [...items];
+        // Replies in flight per post, so maxCommentsPerPost holds across parallel publications
+        const inFlight = new Map<string, number>();
+        const failures: unknown[] = [];
+        const worker = async () => {
+            for (let item = queue.shift(); item && !failures.length; item = queue.shift()) {
+                try {
+                    if (await this.publishOne(item, inFlight)) published++;
+                } catch (error) {
+                    failures.push(error);
+                }
             }
-            const comment: NewComment = { content: this.contentFor(item), author: mirroredAuthor(item) };
-            if (item.kind === "post") {
-                comment.title = mirroredTitle(item);
-                if (item.link) comment.link = item.link;
-            } else {
-                const parent = this.publishedParent(item);
-                if (!parent) continue;
-                comment.parentCid = parent;
-                comment.postCid = this.db.get(this.key, item.postId)!.cid!;
-            }
-            try {
-                const cid = await this.publisher.comment(comment);
-                // An item that was already gone still needs its flair; the label step adds it
-                this.db.update(this.key, item.redditId, {
-                    cid,
-                    publishStatus: "published",
-                    publishedLabel: item.status === "up" ? labelOf(item) : null
-                });
-                published++;
-                await this.ensureAuthorFlair(cid);
-            } catch (error) {
-                if (!(error instanceof PublishRejected)) throw error;
-                this.db.update(this.key, item.redditId, { publishStatus: "failed", publishError: error.message });
-                this.log(`${item.redditId} rejected: ${error.message}`);
-            }
-        }
+        };
+        await Promise.all(Array.from({ length: Math.min(PUBLISH_CONCURRENCY, items.length) }, worker));
+        if (failures.length) throw failures[0];
         return published;
+    }
+
+    // True once the item is published; false when it is held back or rejected
+    private async publishOne(item: Item, inFlight: Map<string, number>): Promise<boolean> {
+        const cap = this.config.maxCommentsPerPost;
+        const capped = item.kind === "comment" && cap !== null && !isGone(item.status);
+        if (capped && this.db.publishedCommentCount(this.key, item.postId) + (inFlight.get(item.postId) ?? 0) >= cap) {
+            this.db.update(this.key, item.redditId, { publishStatus: "failed", publishError: OVER_CAP });
+            return false;
+        }
+        if (capped) inFlight.set(item.postId, (inFlight.get(item.postId) ?? 0) + 1);
+        try {
+            return await this.send(item);
+        } finally {
+            if (capped) inFlight.set(item.postId, inFlight.get(item.postId)! - 1);
+        }
+    }
+
+    private async send(item: Item): Promise<boolean> {
+        const comment: NewComment = { content: this.contentFor(item), author: mirroredAuthor(item) };
+        if (item.kind === "post") {
+            comment.title = mirroredTitle(item);
+            if (item.link) comment.link = item.link;
+        } else {
+            const parent = this.publishedParent(item);
+            if (!parent) return false;
+            comment.parentCid = parent;
+            comment.postCid = this.db.get(this.key, item.postId)!.cid!;
+        }
+        try {
+            const cid = await this.publisher.comment(comment);
+            // An item that was already gone still needs its flair; the label step adds it
+            this.db.update(this.key, item.redditId, {
+                cid,
+                publishStatus: "published",
+                publishedLabel: item.status === "up" ? labelOf(item) : null
+            });
+            await this.ensureAuthorFlair(cid);
+            return true;
+        } catch (error) {
+            if (!(error instanceof PublishRejected)) throw error;
+            this.db.update(this.key, item.redditId, { publishStatus: "failed", publishError: error.message });
+            this.log(`${item.redditId} rejected: ${error.message}`);
+            return false;
+        }
     }
 
     // The cid a reply goes under: its parent's, or with the parent skipped (or, on a removed-only mirror, not wanted),
@@ -536,10 +571,17 @@ export class Mirror {
         return done;
     }
 
-    private async ensureAuthorFlair(cid: string): Promise<void> {
-        if (this.db.mirror(this.key).authorFlairSet) return;
-        await this.publisher.moderate(cid, { author: { flairs: [MIRROR_AUTHOR_FLAIR] } });
-        this.db.updateMirror(this.key, { authorFlairSet: 1 });
+    private ensureAuthorFlair(cid: string): Promise<void> {
+        if (this.db.mirror(this.key).authorFlairSet) return Promise.resolve();
+        this.authorFlair ??= (async () => {
+            try {
+                await this.publisher.moderate(cid, { author: { flairs: [MIRROR_AUTHOR_FLAIR] } });
+                this.db.updateMirror(this.key, { authorFlairSet: 1 });
+            } finally {
+                this.authorFlair = null;
+            }
+        })();
+        return this.authorFlair;
     }
 
     // Brings each published item's flair and note in line with what the checks found

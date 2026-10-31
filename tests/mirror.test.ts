@@ -651,5 +651,53 @@ describe("Mirror", () => {
             expect(await m.backfill(5)).toBe(0);
             expect(asked).toBe(0);
         });
+
+        // The walk runs beside the live tasks: a thread can turn up live between the walk's look at the database and
+        // its record of the archived copy
+        it("leaves a thread alone that the live path recorded while its comments were being fetched", async () => {
+            const live = mirror();
+            const racing = archives({
+                arcticPosts: async (_sub, after, before) => [newer, older].filter((p) => p.createdUtc > after && p.createdUtc < before),
+                arcticThread: async (postId) => {
+                    if (postId === "t3_newer") {
+                        source.posts = [post({ redditId: "t3_newer", postId: "t3_newer", createdUtc: T0 - 10 * DAY })];
+                        await live.discoverPosts();
+                    }
+                    return threads[postId] ?? [];
+                }
+            });
+            const m = mirror(racing, { backfillSince: SINCE });
+            now = T0;
+            expect(await m.backfill(1)).toBe(1);
+            expect(db.get(SUB, "t3_newer")).toMatchObject({ origin: "live" });
+            expect(db.get(SUB, "t1_kept")).toBeUndefined();
+            expect(db.mirror(SUB).backfillCursor).toBe(newer.createdUtc);
+        });
+    });
+
+    describe("publishing in parallel", () => {
+        it("has several publications of a batch in flight at once, and sets the author flair once", async () => {
+            const m = mirror();
+            source.posts = Array.from({ length: 6 }, (_, i) =>
+                post({ redditId: `t3_p${i}`, postId: `t3_p${i}`, permalink: `/r/AskHistorians/comments/p${i}/q/` })
+            );
+            await m.discoverPosts();
+            let inFlight = 0;
+            let most = 0;
+            const comment = publisher.comment.bind(publisher);
+            publisher.comment = async (c: unknown) => {
+                inFlight++;
+                most = Math.max(most, inFlight);
+                await new Promise((resolve) => setTimeout(resolve, 5));
+                inFlight--;
+                return comment(c);
+            };
+            expect(await m.publishPending(50)).toBe(6);
+            expect(most).toBeGreaterThan(1);
+            expect(most).toBeLessThanOrEqual(4);
+            expect(publisher.of("comment")).toHaveLength(6);
+            expect(publisher.of("moderate").filter((c) => "author" in (c[2] as object))).toHaveLength(1);
+            expect(db.publishable(SUB, 50, null)).toEqual([]);
+        });
     });
 });

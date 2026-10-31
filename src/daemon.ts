@@ -1,6 +1,7 @@
 // The mirror daemon: one process for every mirror in config.json. DRY_RUN=1 fetches and records everything in a
 // separate database but publishes nothing, logging what it would publish instead.
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { ArcticShiftBackend } from "./backends/arctic-shift.js";
 import type { LiveSource } from "./backends/live.js";
 import { PullPushBackend } from "./backends/pullpush.js";
@@ -10,19 +11,89 @@ import { SourcePool } from "./backends/source-pool.js";
 import { type Config, loadConfig, type MirrorConfig } from "./config.js";
 import { StateDb } from "./db.js";
 import { type Archives, Mirror, mirrorLabel, type Publisher } from "./mirror.js";
-import { createPkc, ensureCommunity, loadSigner, type PkcInstance, publishComment, publishEdit, publishModeration } from "./pkc.js";
+import {
+    createPkc,
+    ensureCommunity,
+    loadSigner,
+    type PkcInstance,
+    publishComment,
+    publishEdit,
+    publishModeration,
+    rpcLost
+} from "./pkc.js";
 import { localNodeFiles, type NodeFiles, remoteNodeFiles } from "./node-files.js";
 import { sortDataPath, writeSortData } from "./sort-data.js";
 import { openRpcTunnel } from "./tunnel.js";
 
 const MINUTE = 60_000;
 const TICK_MS = 15_000;
+// Archived threads per backfill call; the cursor is saved after each call
+const BACKFILL_BATCH = 20;
 const DRY_RUN = process.env.DRY_RUN === "1";
 
-interface Task {
+export interface Task {
     name: string;
+    // How long after a run the next one is due; for a background task, how long it rests after a run that found no work
     everyMs: number;
+    // A background task has its own loop beside the round of the others, and runs back to back while it returns work
+    // done (a truthy value); the database is synchronous and the sources' throttles are shared, so the two loops
+    // interleave only at network waits
+    background?: boolean;
     run(): Promise<unknown>;
+}
+
+export interface Scheduled {
+    label: string;
+    task: Task;
+    nextAt: number;
+}
+
+interface LoopOptions {
+    stopped: () => boolean;
+    sleep: (ms: number) => Promise<void>;
+    // The process can't go on: the RPC connection is lost (the client never reconnects); exit and let systemd restart
+    onFatal: (reason: string) => void;
+    log: (message: string) => void;
+}
+
+// A task's failure: logged and retried at its next due time, unless it says the RPC is gone, which ends the loop
+function failed(entry: Scheduled, error: unknown, options: LoopOptions): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    if (rpcLost(error)) {
+        options.onFatal(`${entry.label}: the RPC connection is lost (${message})`);
+        return true;
+    }
+    options.log(`${entry.label} failed: ${message}`);
+    return false;
+}
+
+// The round of the ordinary tasks, one at a time, each when due
+export async function runTasks(scheduled: Scheduled[], options: LoopOptions): Promise<void> {
+    while (!options.stopped()) {
+        for (const entry of scheduled) {
+            if (options.stopped() || entry.nextAt > Date.now()) continue;
+            try {
+                await entry.task.run();
+            } catch (error) {
+                if (failed(entry, error, options)) return;
+            }
+            entry.nextAt = Date.now() + entry.task.everyMs;
+        }
+        await options.sleep(TICK_MS);
+    }
+}
+
+// A background task's own loop: back to back while there is work, a rest of everyMs otherwise or after a failure
+export async function runBackground(entry: Scheduled, options: LoopOptions): Promise<void> {
+    while (!options.stopped()) {
+        let rest = true;
+        try {
+            rest = !(await entry.task.run());
+        } catch (error) {
+            if (failed(entry, error, options)) return;
+        }
+        if (rest) await options.sleep(entry.task.everyMs);
+    }
 }
 
 function liveSources(config: Config): SourcePool<LiveSource> {
@@ -121,8 +192,9 @@ export function tasksOf(mirror: Mirror, mirrorConfig: MirrorConfig, db: StateDb,
         }
     ];
     if (mirrorConfig.threadSummary) tasks.push({ name: "thread summaries", everyMs: 5 * MINUTE, run: () => mirror.updateSummaries() });
-    // A few archived threads per tick, between the live tasks; a no-op once the cursor reached backfillSince
-    if (mirrorConfig.backfillSince) tasks.push({ name: "backfill", everyMs: 0, run: () => mirror.backfill(5) });
+    // Its own loop beside the live tasks, paced by the Arctic Shift throttle alone; idle once the cursor reached backfillSince
+    if (mirrorConfig.backfillSince)
+        tasks.push({ name: "backfill", everyMs: TICK_MS, background: true, run: () => mirror.backfill(BACKFILL_BATCH) });
     const address = db.mirror(mirror.key).communityAddress;
     if (address && !DRY_RUN)
         tasks.push({
@@ -141,20 +213,18 @@ async function main() {
     const config = loadConfig();
     const db = new StateDb(path.join(config.dataDir, DRY_RUN ? "dry-run.sqlite" : "state.sqlite"));
     // A dead tunnel can't be reopened under a running pkc instance: exit, and let systemd restart the daemon
-    const tunnel =
-        config.rpcSshHost && !DRY_RUN
-            ? await openRpcTunnel(config.rpcSshHost, config.rpcPort, (reason) => {
-                  console.error(reason);
-                  process.exit(1);
-              })
-            : undefined;
+    const die = (reason: string) => {
+        console.error(reason);
+        process.exit(1);
+    };
+    const tunnel = config.rpcSshHost && !DRY_RUN ? await openRpcTunnel(config.rpcSshHost, config.rpcPort, die) : undefined;
     const nodeFiles = config.rpcSshHost ? remoteNodeFiles(config.rpcSshHost, config.nodeDir!) : localNodeFiles(config.dataDir);
     if (!DRY_RUN) await nodeFiles.pushSorts();
-    const pkc = DRY_RUN ? null : await createPkc(tunnel?.rpcUrl ?? config.rpcUrl);
+    const pkc = DRY_RUN ? null : await createPkc(tunnel?.rpcUrl ?? config.rpcUrl, () => die("the RPC connection is lost"));
     const live = liveSources(config);
     const archives = archivesOf(config);
 
-    const scheduled: { label: string; task: Task; nextAt: number }[] = [];
+    const scheduled: Scheduled[] = [];
     for (const mirrorConfig of config.mirrors) {
         const publisher = pkc ? await pkcPublisher(pkc, db, nodeFiles, config, mirrorConfig) : dryRunPublisher(mirrorConfig);
         const mirror = new Mirror(db, mirrorConfig, live, archives, publisher);
@@ -170,19 +240,20 @@ async function main() {
     process.on("SIGINT", stop);
     console.log(`running ${config.mirrors.length} mirror(s)${DRY_RUN ? " in dry-run mode" : ""}`);
 
-    // One task at a time: the database and the sources' throttles are shared
-    while (!stopping) {
-        for (const entry of scheduled) {
-            if (stopping || entry.nextAt > Date.now()) continue;
-            try {
-                await entry.task.run();
-            } catch (error) {
-                console.error(`${entry.label} failed:`, error instanceof Error ? error.message : error);
-            }
-            entry.nextAt = Date.now() + entry.task.everyMs;
-        }
-        await new Promise((resolve) => setTimeout(resolve, TICK_MS));
-    }
+    const options: LoopOptions = {
+        stopped: () => stopping,
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        onFatal: die,
+        log: (message) => console.error(message)
+    };
+    // One ordinary task at a time, the background ones beside them
+    await Promise.all([
+        runTasks(
+            scheduled.filter((entry) => !entry.task.background),
+            options
+        ),
+        ...scheduled.filter((entry) => entry.task.background).map((entry) => runBackground(entry, options))
+    ]);
 
     console.log("stopping");
     await pkc?.destroy();
@@ -190,4 +261,5 @@ async function main() {
     db.close();
 }
 
-await main();
+// Run as the entry point only: the tests import this module for its pieces
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

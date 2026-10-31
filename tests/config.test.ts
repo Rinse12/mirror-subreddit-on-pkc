@@ -14,7 +14,7 @@ describe("parseConfig", () => {
             subreddit: "AskHistorians",
             hotSort: "removed-only",
             backfillOnly: "removed",
-            backfillSince: "2026-01-01T00:00:00Z"
+            backfillSince: "2023-07-01T00:00:00Z"
         });
         expect(config.mirrors[2]).toMatchObject({ subreddit: "NoNewNormal", archiveOnly: true, publish: "removed-only" });
     });

@@ -10,10 +10,17 @@ export type BotSigner = Awaited<ReturnType<PkcInstance["createSigner"]>>;
 const PUBLISH_TIMEOUT_MS = 5 * 60_000;
 export const SORTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../sorts");
 
-export async function createPkc(rpcUrl: string): Promise<PkcInstance> {
+// pkc-js's error once the RPC server went away under a running client (the node's bitsocial service restarted, the
+// tunnel still up): the client never reconnects, so every call fails with it from then on
+export const rpcLost = (error: unknown): boolean => (error as { code?: unknown } | null)?.code === "ERR_FAILED_TO_OPEN_CONNECTION_TO_RPC";
+
+export async function createPkc(rpcUrl: string, onRpcLost: (error: unknown) => void = () => {}): Promise<PkcInstance> {
     const pkc = await PKC({ pkcRpcClientsOptions: [rpcUrl] });
     // pkc-js has no default error listener; without one an unhandled 'error' would crash the process
-    pkc.on("error", (error: unknown) => console.error("pkc error:", error));
+    pkc.on("error", (error: unknown) => {
+        console.error("pkc error:", error);
+        if (rpcLost(error)) onRpcLost(error);
+    });
     return pkc;
 }
 
