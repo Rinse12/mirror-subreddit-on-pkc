@@ -63,6 +63,9 @@ const removedWithText = (item: Archived) => item.status === "removed" && (item.k
 // Publications of a batch in flight at once. Each waits about ten seconds for the community's verification, and the
 // items of a batch are independent: publishable offers a reply only once its parent is published.
 export const PUBLISH_CONCURRENCY = 4;
+// Seconds a publish or label run takes items for. A busy community verifies a publication in tens of seconds, and
+// the run must not hold the round of live tasks for a batch of 100 of those; what is left waits for the next run.
+export const PUBLISH_BUDGET_S = 120;
 
 // What the log prefix and the state key of a mirror look like: the subreddit, unless the mirror was named
 export const mirrorLabel = (config: Pick<MirrorConfig, "name" | "subreddit">) =>
@@ -423,31 +426,32 @@ export class Mirror {
         return base + removalNote(item);
     }
 
-    async publishPending(limit: number): Promise<number> {
+    async publishPending(limit: number, budgetS = PUBLISH_BUDGET_S): Promise<number> {
+        const deadline = this.now() + budgetS;
         let published = 0;
         // Re-queried after each batch: a reply becomes publishable once its parent went out in the batch before
         for (
             let batch = this.db.publishable(this.key, limit, this.publishFilter);
-            batch.length && published < limit;
+            batch.length && published < limit && this.now() < deadline;
             batch = this.db.publishable(this.key, limit - published, this.publishFilter)
         ) {
-            const n = await this.publishBatch(batch);
+            const n = await this.publishBatch(batch, deadline);
             if (!n) break;
             published += n;
         }
         return published;
     }
 
-    // PUBLISH_CONCURRENCY workers over the batch; an error other than a rejection stops the batch and is rethrown once
-    // the publications in flight are done
-    private async publishBatch(items: Item[]): Promise<number> {
+    // PUBLISH_CONCURRENCY workers over the batch, each taking the next item while the deadline (unix seconds) allows;
+    // an error other than a rejection stops the batch and is rethrown once the publications in flight are done
+    private async publishBatch(items: Item[], deadline: number): Promise<number> {
         let published = 0;
         const queue = [...items];
         // Replies in flight per post, so maxCommentsPerPost holds across parallel publications
         const inFlight = new Map<string, number>();
         const failures: unknown[] = [];
         const worker = async () => {
-            for (let item = queue.shift(); item && !failures.length; item = queue.shift()) {
+            for (let item = queue.shift(); item && !failures.length; item = this.now() < deadline ? queue.shift() : undefined) {
                 try {
                     if (await this.publishOne(item, inFlight)) published++;
                 } catch (error) {
@@ -585,9 +589,11 @@ export class Mirror {
     }
 
     // Brings each published item's flair and note in line with what the checks found
-    async publishLabels(limit: number): Promise<number> {
+    async publishLabels(limit: number, budgetS = PUBLISH_BUDGET_S): Promise<number> {
+        const deadline = this.now() + budgetS;
         let done = 0;
         for (const item of this.db.labelsToPublish(this.key, limit)) {
+            if (done && this.now() >= deadline) break;
             const flair = statusFlair(item);
             try {
                 if (item.publishedLabel === null || item.publishedLabel.split(":")[0] !== "up" || flair)

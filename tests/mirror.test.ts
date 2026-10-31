@@ -675,6 +675,40 @@ describe("Mirror", () => {
         });
     });
 
+    describe("publishing with a time budget", () => {
+        // A slow community verifies a publication in tens of seconds; a batch of 100 must not hold the round of live
+        // tasks for the whole of it
+        it("stops taking items once the budget is spent, and resumes on the next call", async () => {
+            const m = mirror();
+            source.posts = Array.from({ length: 6 }, (_, i) =>
+                post({ redditId: `t3_p${i}`, postId: `t3_p${i}`, permalink: `/r/AskHistorians/comments/p${i}/q/` })
+            );
+            await m.discoverPosts();
+            const send = publisher.comment.bind(publisher);
+            publisher.comment = async (c: unknown) => {
+                now += 40;
+                return send(c);
+            };
+            // 4 in flight at once, each taking 40 s of the clock: the first round of 4 spends 160 s, over the 100 s budget
+            expect(await m.publishPending(50, 100)).toBe(4);
+            expect(await m.publishPending(50, 100)).toBe(2);
+
+            await mirrorThread(m, [comment("t1_a", POST), comment("t1_b", POST)]);
+            source.thread = { post: post(), comments: [] };
+            source.permalinks.clear();
+            now += 3600;
+            await m.checkDuePosts(10);
+            expect(db.labelsToPublish(SUB, 10)).toHaveLength(2);
+            const edit = publisher.edit.bind(publisher);
+            publisher.edit = async (cid: string, content: string) => {
+                now += 40;
+                return edit(cid, content);
+            };
+            expect(await m.publishLabels(10, 30)).toBe(1);
+            expect(await m.publishLabels(10, 30)).toBe(1);
+        });
+    });
+
     describe("publishing in parallel", () => {
         it("has several publications of a batch in flight at once, and sets the author flair once", async () => {
             const m = mirror();
