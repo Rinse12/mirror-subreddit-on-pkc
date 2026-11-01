@@ -14,6 +14,11 @@ export class SourcePool<S> {
     ) {}
 
     async run<T>(task: (source: S) => Promise<T>): Promise<T> {
+        return (await this.runWith(task)).result;
+    }
+
+    // The result and the source that gave it
+    async runWith<T>(task: (source: S) => Promise<T>): Promise<{ result: T; source: S }> {
         const failures: string[] = [];
         for (const source of this.sources) {
             const cooldown = this.cooldowns.get(source);
@@ -21,7 +26,7 @@ export class SourcePool<S> {
             try {
                 const result = await task(source);
                 this.cooldowns.delete(source);
-                return result;
+                return { result, source };
             } catch (error) {
                 if (!(error instanceof FetchError)) throw error;
                 const ms = cooldown ? Math.min(cooldown.ms * 2, MAX_COOLDOWN_MS) : MIN_COOLDOWN_MS;

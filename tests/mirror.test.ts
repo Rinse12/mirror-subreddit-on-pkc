@@ -152,6 +152,13 @@ describe("Mirror", () => {
         expect(db.get(SUB, "t1_auto")!.status).toBe("up");
     });
 
+    it("records which source first saw each item, by the live source's name", async () => {
+        const m = mirror();
+        await mirrorThread(m, [comment("t1_q", POST)]);
+        expect(db.get(SUB, POST)).toMatchObject({ origin: "live", source: "fake" });
+        expect(db.get(SUB, "t1_q")).toMatchObject({ origin: "live", source: "fake" });
+    });
+
     it("purges an already published comment of a skipped author and republishes its reply tree", async () => {
         const m = mirror(archives(), { skipAuthors: [] });
         await mirrorThread(m, [comment("t1_auto", POST, { author: "AutoModerator" }), comment("t1_q", "t1_auto"), comment("t1_a", "t1_q")]);
@@ -311,7 +318,14 @@ describe("Mirror", () => {
         );
         await mirrorThread(m, []);
         await m.readArcticFeed();
-        expect(db.get(SUB, "t1_x")).toMatchObject({ body: "seen by Arctic Shift", status: "up", lastSeenUpAt: T0 + 100 });
+        expect(db.get(SUB, "t1_x")).toMatchObject({
+            body: "seen by Arctic Shift",
+            status: "up",
+            lastSeenUpAt: T0 + 100,
+            source: "arctic-feed"
+        });
+        // Our own read came first: the source stays the one that saw it first
+        expect(db.get(SUB, POST)).toMatchObject({ source: "fake" });
         await m.fillMissingText();
         expect(db.get(SUB, "t1_y")).toMatchObject({ body: "seen by PullPush", textLookups: 1 });
         // Not shown on Reddit any more: confirmed gone at the next read
@@ -553,7 +567,13 @@ describe("Mirror", () => {
             const m = mirror(archive(), { backfillSince: SINCE });
             now = T0;
             expect(await m.backfill(1)).toBe(1);
-            expect(db.get(SUB, "t3_newer")).toMatchObject({ origin: "archive", nextCheckAt: null, lastSeenUpAt: newer.recheckedOn });
+            expect(db.get(SUB, "t3_newer")).toMatchObject({
+                origin: "archive",
+                source: "arctic-walk",
+                nextCheckAt: null,
+                lastSeenUpAt: newer.recheckedOn
+            });
+            expect(db.get(SUB, "t1_kept")).toMatchObject({ source: "arctic-walk" });
             expect(db.get(SUB, "t3_older")).toBeUndefined();
             expect(db.get(SUB, "t1_kept")).toMatchObject({
                 status: "removed",

@@ -102,7 +102,7 @@ export class Mirror {
         return this.config.skipAuthors.some((skipped) => skipped.toLowerCase() === author.toLowerCase());
     }
 
-    private newItem(observed: Observed, now: number): Item {
+    private newItem(observed: Observed, now: number, source: string): Item {
         const gone = isGone(observed.status);
         return {
             mirror: this.key,
@@ -119,6 +119,7 @@ export class Mirror {
             publishError: null,
             publishedLabel: null,
             origin: "live",
+            source,
             summaryCid: null,
             summaryText: null
         };
@@ -128,7 +129,7 @@ export class Mirror {
     // kept), gone at the re-check. A removed comment whose text the archive lost is recorded but never published.
     private archivedItem(archived: Archived, now: number): Item {
         const gone = isGone(archived.status);
-        const item = this.newItem(archived, now);
+        const item = this.newItem(archived, now, "arctic-walk");
         const textless = archived.kind === "comment" && gone && archived.body === null;
         return {
             ...item,
@@ -172,15 +173,16 @@ export class Mirror {
         this.db.update(this.key, item.redditId, changes);
     }
 
-    private record(observed: Observed, now: number): Item {
+    // Folds a sighting from a live source in; the source is recorded only for an item seen for the first time
+    private record(observed: Observed, now: number, source: string): Item {
         const item = this.db.get(this.key, observed.redditId);
         if (item) this.observe(item, observed, now);
-        else this.db.insert(this.newItem(observed, now));
+        else this.db.insert(this.newItem(observed, now, source));
         return this.db.get(this.key, observed.redditId)!;
     }
 
     async discoverPosts(): Promise<number> {
-        const posts = await this.live.run((source) => source.listNewPosts(this.subreddit));
+        const { result: posts, source } = await this.live.runWith((source) => source.listNewPosts(this.subreddit));
         const now = this.now();
         let added = 0;
         this.db.transaction(() => {
@@ -188,7 +190,7 @@ export class Mirror {
                 const known = this.db.get(this.key, post.redditId);
                 if (!known && post.score !== null && post.score < this.config.minScore) continue;
                 if (!known) added++;
-                this.record(post, now);
+                this.record(post, now, source.name);
             }
         });
         if (added) this.log(`found ${added} new posts`);
@@ -210,15 +212,15 @@ export class Mirror {
     // Re-reads a thread: refreshes the post and every comment shown, finds new comments, and confirms the ones
     // that disappeared through their own permalink
     async checkThread(post: Item): Promise<void> {
-        const thread = await this.live.run((source) => source.fetchThread(post.permalink));
+        const { result: thread, source } = await this.live.runWith((source) => source.fetchThread(post.permalink));
         await this.resolveParents(thread.comments);
         const now = this.now();
         const seen = new Set<string>();
         this.db.transaction(() => {
-            this.record(thread.post, now);
+            this.record(thread.post, now, source.name);
             for (const comment of thread.comments) {
                 seen.add(comment.redditId);
-                this.record(comment, now);
+                this.record(comment, now, source.name);
             }
             this.db.update(this.key, post.redditId, {
                 nextCheckAt: nextCheckAt(post.createdUtc, now, this.config.commentUpdateDays)
@@ -357,7 +359,7 @@ export class Mirror {
                             });
                     }
                     // Seen by Arctic Shift, not yet by us: it was up when made, the next thread read decides the rest
-                    else this.db.insert({ ...this.newItem(comment, now), lastSeenUpAt: comment.createdUtc });
+                    else this.db.insert({ ...this.newItem(comment, now, "arctic-feed"), lastSeenUpAt: comment.createdUtc });
                 }
             });
             if (comments.length) cursor = Math.max(cursor, ...comments.map((c) => c.createdUtc));

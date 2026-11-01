@@ -11,6 +11,10 @@ export type PublishStatus = "pending" | "published" | "failed" | "skipped";
 // live: seen on Reddit by the daemon. archive: backfilled from Arctic Shift, so its removal window is the archive's
 // two reads and its note says so
 export type ItemOrigin = "live" | "archive";
+// Which backend first saw the item: a live source's name (`redlib <instance>`, `reddit-json`), `arctic-feed` (Arctic
+// Shift's comment search, polled beside the live reads) or `arctic-walk` (the backfill). Null on rows recorded
+// before the column existed, unless they came from the walk.
+export type ItemSource = string;
 
 export interface Item {
     // The mirror's name (config `name`, the subreddit by default): two mirrors of one subreddit keep separate state
@@ -51,6 +55,7 @@ export interface Item {
     // The label already shown on the community (flair and note), "<status>:<removedBy>", so changes go out once
     publishedLabel: string | null;
     origin: ItemOrigin;
+    source: ItemSource | null;
     // Posts only: the bot's pinned reply that lists the thread's removed replies, and the text it was last given
     summaryCid: string | null;
     summaryText: string | null;
@@ -101,6 +106,7 @@ CREATE TABLE IF NOT EXISTS items (
     publishError TEXT,
     publishedLabel TEXT,
     origin TEXT NOT NULL DEFAULT 'live',
+    source TEXT,
     summaryCid TEXT,
     summaryText TEXT,
     PRIMARY KEY (mirror, redditId)
@@ -129,8 +135,12 @@ const MIGRATIONS: [table: string, column: string, definition: string][] = [
     ["items", "origin", "TEXT NOT NULL DEFAULT 'live'"],
     ["items", "summaryCid", "TEXT"],
     ["items", "summaryText", "TEXT"],
+    ["items", "source", "TEXT"],
     ["mirrors", "backfillCursor", "INTEGER"]
 ];
+
+// Rows from before a column existed, where the value follows from the rest of the row
+const BACKFILLS = ["UPDATE items SET source = 'arctic-walk' WHERE source IS NULL AND origin = 'archive'"];
 
 const COLUMNS: (keyof Item)[] = [
     "mirror",
@@ -159,6 +169,7 @@ const COLUMNS: (keyof Item)[] = [
     "publishError",
     "publishedLabel",
     "origin",
+    "source",
     "summaryCid",
     "summaryText"
 ];
@@ -177,6 +188,7 @@ export class StateDb {
         this.db.exec(SCHEMA);
         for (const [table, column, definition] of MIGRATIONS)
             if (!columns(table).includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        for (const backfill of BACKFILLS) this.db.exec(backfill);
     }
 
     close() {

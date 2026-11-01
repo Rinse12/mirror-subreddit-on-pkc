@@ -36,6 +36,7 @@ const item = (overrides: Partial<Item> = {}): Item => ({
     publishError: null,
     publishedLabel: null,
     origin: "live",
+    source: "redlib http://redlib.test",
     summaryCid: null,
     summaryText: null,
     ...overrides
@@ -74,13 +75,19 @@ describe("StateDb", () => {
             author TEXT NOT NULL, createdUtc INTEGER NOT NULL, title TEXT, body TEXT, link TEXT, permalink TEXT NOT NULL, score INTEGER,
             numComments INTEGER, status TEXT NOT NULL, removedBy TEXT, lastSeenUpAt INTEGER NOT NULL, goneSeenAt INTEGER, nextCheckAt INTEGER,
             textLookups INTEGER NOT NULL DEFAULT 0, labelLookups INTEGER NOT NULL DEFAULT 0, labelCheckedAt INTEGER, cid TEXT UNIQUE,
-            publishStatus TEXT NOT NULL DEFAULT 'pending', publishError TEXT, publishedLabel TEXT, PRIMARY KEY (subreddit, redditId));
+            publishStatus TEXT NOT NULL DEFAULT 'pending', publishError TEXT, publishedLabel TEXT, origin TEXT NOT NULL DEFAULT 'live',
+            PRIMARY KEY (subreddit, redditId));
             CREATE TABLE mirrors (subreddit TEXT PRIMARY KEY, communityAddress TEXT, authorFlairSet INTEGER NOT NULL DEFAULT 0, arcticCursor INTEGER NOT NULL DEFAULT 0);
             INSERT INTO items (subreddit, redditId, kind, postId, author, createdUtc, permalink, status, lastSeenUpAt)
-            VALUES ('AskHistorians', 't3_a', 'post', 't3_a', 'x', 1, '/r/a', 'up', 1);`);
+            VALUES ('AskHistorians', 't3_a', 'post', 't3_a', 'x', 1, '/r/a', 'up', 1);
+            INSERT INTO items (subreddit, redditId, kind, postId, author, createdUtc, permalink, status, lastSeenUpAt, origin)
+            VALUES ('AskHistorians', 't3_b', 'post', 't3_b', 'x', 1, '/r/b', 'up', 1, 'archive');`);
         old.close();
         db = new StateDb(file);
         expect(db.get("AskHistorians", "t3_a")).toMatchObject({ mirror: "AskHistorians", origin: "live", summaryCid: null });
+        // Which live source saw an old row is unknown; an archived row can only have come from the backfill walk
+        expect(db.get("AskHistorians", "t3_a")!.source).toBeNull();
+        expect(db.get("AskHistorians", "t3_b")!.source).toBe("arctic-walk");
         expect(db.mirror("AskHistorians").backfillCursor).toBeNull();
         // Opening it again finds nothing left to migrate
         db.close();
