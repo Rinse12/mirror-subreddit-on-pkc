@@ -14,6 +14,7 @@
             "subreddit": "AskHistorians",
             "signerPath": "data/signers/askhistorians.json",
             "hotSort": "removed-only",
+            "replySort": "removed-only",
             "backfillSince": "2023-07-01T00:00:00Z",
             "backfillOnly": "removed"
         },

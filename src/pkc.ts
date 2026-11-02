@@ -162,15 +162,24 @@ const sortEntry = (sortsDir: string, file: string, sortDataFile: string, preload
 });
 
 export type HotSort = MirrorConfig["hotSort"];
+export type ReplySort = MirrorConfig["replySort"];
 export type PublishMode = MirrorConfig["publish"];
 
 // The page sorts of a mirror community (see README, Scores). Post sorts take the built-in names Seedit requests (`hot`
 // preloaded, `new`, `active`), since a path file under a built-in name keeps the community's order on the client while a
 // name nobody asks for is never shown. With hotSort "removed-only" the flaired filter is what `hot` serves, busiest
 // threads first, Reddit's hot order moves to `mirrored-reddit-hot`, and `flaired` keeps the most-recently-removed order
-// under its own name. The reply sort keeps its own name: a reply file published as `best` would be re-sorted by the client.
-export function pageSettings(sortDataFile: string, sortsDir = SORTS_DIR, hotSort: HotSort = "reddit-hot") {
+// under its own name. The reply sorts keep their own names: a reply file published as `best` would be re-sorted by the
+// client. With replySort "removed-only" the preloaded reply page is the flaired tree (the removed replies in place with
+// the parents above them) and Reddit's best order moves off the preload.
+export function pageSettings(
+    sortDataFile: string,
+    sortsDir = SORTS_DIR,
+    hotSort: HotSort = "reddit-hot",
+    replySort: ReplySort = "reddit-best"
+) {
     const flairedOptions = { order: "flaired" };
+    const weight = { nativeWeight: "1" };
     return {
         posts: [
             ...(hotSort === "removed-only"
@@ -189,8 +198,9 @@ export function pageSettings(sortDataFile: string, sortsDir = SORTS_DIR, hotSort
             { name: "active" }
         ],
         replies: [
-            sortEntry(sortsDir, "mirrored-reddit-best.js", sortDataFile, true, { nativeWeight: "1" }),
-            sortEntry(sortsDir, "flaired-replies.js", sortDataFile, false, { nativeWeight: "1" })
+            ...(replySort === "removed-only" ? [sortEntry(sortsDir, "flaired-tree.js", sortDataFile, true, weight)] : []),
+            sortEntry(sortsDir, "mirrored-reddit-best.js", sortDataFile, replySort !== "removed-only", weight),
+            sortEntry(sortsDir, "flaired-replies.js", sortDataFile, false, weight)
         ]
     };
 }
@@ -209,7 +219,8 @@ export function communityEdit(
     botAddress: string,
     sortDataFile: string,
     sortsDir = SORTS_DIR,
-    hotSort: HotSort = "reddit-hot"
+    hotSort: HotSort = "reddit-hot",
+    replySort: ReplySort = "reddit-best"
 ): (CommunityState & { reasons: string[] }) | null {
     const roles = current.roles?.[botAddress] ? current.roles : { ...current.roles, [botAddress]: { role: "moderator" } };
     const challenges = (current.settings?.challenges ?? []).map((challenge) =>
@@ -217,7 +228,7 @@ export function communityEdit(
             ? challenge
             : { ...challenge, exclude: [...(challenge.exclude ?? []), { publicKeys: [botAddress] }] }
     );
-    const pages = pageSettings(sortDataFile, sortsDir, hotSort);
+    const pages = pageSettings(sortDataFile, sortsDir, hotSort, replySort);
     const settings = { ...current.settings, challenges, pages };
     const reasons = [
         roles !== current.roles ? "roles" : null,
@@ -268,6 +279,7 @@ export async function ensureCommunity(
         sortsDir: string;
         sortDataFile: (address: string) => string;
         hotSort: HotSort;
+        replySort: ReplySort;
         publish: PublishMode;
     }
 ): Promise<string> {
@@ -298,7 +310,14 @@ export async function ensureCommunity(
     );
     // settings is replaced wholesale on edit: editing without having read it would wipe the challenges
     if (!local.settings) throw new Error(`${local.address} came back without its settings; is it hosted on this RPC node?`);
-    const edit = communityEdit(local, options.botAddress, options.sortDataFile(local.address), options.sortsDir, options.hotSort);
+    const edit = communityEdit(
+        local,
+        options.botAddress,
+        options.sortDataFile(local.address),
+        options.sortsDir,
+        options.hotSort,
+        options.replySort
+    );
     if (edit) {
         const { reasons, ...changes } = edit;
         await local.edit(changes);

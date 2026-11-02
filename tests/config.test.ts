@@ -32,6 +32,7 @@ describe("parseConfig", () => {
             authorDeleted: "hide",
             maxCommentsPerPost: null,
             hotSort: "reddit-hot",
+            replySort: "reddit-best",
             publish: "all",
             context: "ancestors",
             threadSummary: false,
@@ -84,6 +85,7 @@ describe("parseConfig", () => {
         );
         expect(() => parseConfig({ mirrors: [{ ...mirror, backfillSince: "2026-01-01" }] })).toThrow(/mirrors\.0\.backfillSince/);
         expect(() => parseConfig({ mirrors: [{ ...mirror, hotSort: "flaired" }] })).toThrow(/mirrors\.0\.hotSort/);
+        expect(() => parseConfig({ mirrors: [{ ...mirror, replySort: "flaired" }] })).toThrow(/mirrors\.0\.replySort/);
     });
 
     it("rejects unknown keys", () => {

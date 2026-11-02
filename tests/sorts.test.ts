@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_FLAIRS } from "../sorts/flair-filter.js";
 import flairedHot from "../sorts/flaired-hot.js";
 import flairedReplies from "../sorts/flaired-replies.js";
+import flairedTree from "../sorts/flaired-tree.js";
 import flaired from "../sorts/flaired.js";
 import hot from "../sorts/hot.js";
 import mirroredRedditBest from "../sorts/mirrored-reddit-best.js";
@@ -15,7 +16,7 @@ import removedFirst from "../sorts/removed-first.js";
 import { redditHot } from "../sorts/sort-data.js";
 
 const NOW = 1793296000;
-const ALL = [hot, mirroredRedditHot, redditNew, removedFirst, flaired, flairedHot, mirroredRedditBest, flairedReplies];
+const ALL = [hot, mirroredRedditHot, redditNew, removedFirst, flaired, flairedHot, mirroredRedditBest, flairedReplies, flairedTree];
 
 // Each test gets its own file: sort-data.js caches one map per path
 function sortDataFile(data: Record<string, unknown>) {
@@ -59,9 +60,11 @@ describe("page sort files", () => {
             "flaired",
             "hot",
             "mirrored-reddit-best",
-            "flaired"
+            "flaired",
+            "flaired-tree"
         ]);
         expect(flairedReplies(settings(file) as never)).toMatchObject({ scope: "replies", flat: true });
+        expect(flairedTree(settings(file) as never)).toMatchObject({ scope: "replies", flat: false, requireReplies: true });
         expect(flaired(settings(file) as never)).toMatchObject({ scope: "posts", requireReplies: true });
     });
 
@@ -226,6 +229,41 @@ describe("flaired (replies)", () => {
             score(args("QmB", NOW, 0, ["Removed on Reddit"]) as never) as number
         );
         expect(score(args("QmNative", NOW, 2, ["Removed by mods on Reddit"]) as never) as number).toBeCloseTo(2 - NOW / 1e10);
+    });
+});
+
+describe("flaired-tree (replies)", () => {
+    const reply = (cid: string, flairs?: string[]) => ({
+        comment: { timestamp: NOW },
+        commentUpdate: { cid, ...(flairs ? { flairs: flairs.map((text) => ({ text })) } : {}) }
+    });
+
+    it("keeps a reply that carries a flair or has a flaired reply anywhere under it, declines the rest, in mirrored-reddit-best order", () => {
+        const file = sortDataFile({
+            QmA: { score: 10, createdUtc: NOW - 100, status: "up", flairedAt: null },
+            QmB: { score: 50, createdUtc: NOW - 50, status: "up", flairedAt: null },
+            QmGone: { score: 1, createdUtc: NOW - 20, status: "removed", removedBy: "removed", flairedAt: NOW }
+        });
+        const { score } = flairedTree(settings(file) as never);
+        const best = mirroredRedditBest(settings(file) as never).score;
+        // Its own flair
+        expect(score({ ...args("QmGone", NOW, 0, ["Removed on Reddit"]), replies: [] } as never)).toBe(best(args("QmGone", NOW) as never));
+        // A flaired reply deep under it: the chain above a removed reply stays
+        expect(score({ ...args("QmA", NOW), replies: [reply("QmMid"), reply("QmGone", ["Removed by mods on Reddit"])] } as never)).toBe(
+            best(args("QmA", NOW) as never)
+        );
+        // Nothing flaired on it or under it
+        expect(score({ ...args("QmB", NOW), replies: [reply("QmMid"), reply("QmOther", ["Something else"])] } as never)).toBeNull();
+        expect(score({ ...args("QmB", NOW), replies: [] } as never)).toBeNull();
+        // Author deletions don't count by default; the flairs option decides
+        expect(score({ ...args("QmB", NOW), replies: [reply("QmDel", ["Deleted by author on Reddit"])] } as never)).toBeNull();
+        expect(
+            score({
+                ...args("QmB", NOW),
+                options: { nativeWeight: "1", flairs: "Deleted by author on Reddit" },
+                replies: [reply("QmDel", ["Deleted by author on Reddit"])]
+            } as never)
+        ).toBe(best(args("QmB", NOW) as never));
     });
 });
 

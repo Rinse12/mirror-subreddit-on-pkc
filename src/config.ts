@@ -33,6 +33,9 @@ const MirrorSchema = z
         // What the community serves as `hot`, the page Seedit opens on: Reddit's hot order, or only what Reddit removed
         // (the `flaired` filter), with Reddit's hot order moving to `mirrored-reddit-hot`
         hotSort: z.enum(["reddit-hot", "removed-only"]).default("reddit-hot"),
+        // What a thread shows as its preloaded reply page: Reddit's best order with every reply, or only the replies
+        // Reddit removed with the chain of parents above each (the `flaired-tree` sort)
+        replySort: z.enum(["reddit-best", "removed-only"]).default("reddit-best"),
         // "all": every captured item is published. "removed-only": only items Reddit removed, plus their context (the
         // post, and with `context: "ancestors"` the comments between the post and a removed reply); the rest is
         // captured but stays in the database

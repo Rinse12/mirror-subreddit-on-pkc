@@ -147,6 +147,7 @@ async function pkcPublisher(pkc: PkcInstance, db: StateDb, nodeFiles: NodeFiles,
         sortsDir: nodeFiles.sortsDir,
         sortDataFile: nodeFiles.sortDataFile,
         hotSort: mirror.hotSort,
+        replySort: mirror.replySort,
         publish: mirror.publish
     });
     db.updateMirror(mirror.name, { communityAddress: address });

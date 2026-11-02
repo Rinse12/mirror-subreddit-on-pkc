@@ -80,6 +80,20 @@ describe("pageSettings", () => {
         expect(files(pages.posts)[1].options).toEqual({ sortDataPath: FILE, order: "flaired" });
         expect(communityEdit({ settings: { challenges: [] } }, BOT, FILE, undefined, "removed-only")?.settings?.pages).toEqual(pages);
     });
+
+    it("with replySort removed-only preloads the flaired tree inside threads and keeps the other reply sorts under their names", () => {
+        const pages = pageSettings(FILE, undefined, "removed-only", "removed-only");
+        expect(named(pages.replies)).toEqual([
+            ["flaired-tree.js", true],
+            ["mirrored-reddit-best.js", false],
+            ["flaired-replies.js", false]
+        ]);
+        expect(files(pages.replies)[0].options).toEqual({ sortDataPath: FILE, nativeWeight: "1" });
+        expect(
+            communityEdit({ settings: { challenges: [] } }, BOT, FILE, undefined, "removed-only", "removed-only")?.settings?.pages
+        ).toEqual(pages);
+        expect(named(pageSettings(FILE, undefined, "removed-only", "reddit-best").replies)).toEqual(named(pageSettings(FILE).replies));
+    });
 });
 
 describe("pageSettings on a remote node", () => {
