@@ -65,6 +65,14 @@ export function removerShort(item: Pick<Item, "status" | "removedBy" | "kind">):
     }
 }
 
+// The flair texts statusFlair gives removed items (author deletions and locks left out): what the flair filter pages match
+export const REMOVAL_FLAIRS = [
+    "Removed by mods on Reddit",
+    "Removed by Reddit admins",
+    "Removed on Reddit",
+    "Removed or deleted on Reddit"
+];
+
 export function statusFlair(item: Pick<Item, "status" | "removedBy" | "kind">): { text: string } | null {
     if (item.status === "up" || item.status === "missing") return null;
     if (item.status === "deleted") return { text: "Deleted by author on Reddit" };

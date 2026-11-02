@@ -1,13 +1,15 @@
 import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { SORTS_DIR } from "./pkc.js";
+import { FLAIR_SORT_DIST, FLAIR_SORT_SUBDIR, SORTS_DIR } from "./pkc.js";
 
 const run = promisify(execFile);
 
 // Where the page sort files and their data live on the machine that runs the community: the sorts are import()ed
 // by the community node, so with rpcSshHost they are pushed there over ssh. rsync writes to a temp file and
-// renames it, so a sort never reads half a file.
+// renames it, so a sort never reads half a file. The flair filter's files (the dist/ of @pkcprotocol/flair-page-sort)
+// go under <sortsDir>/flair-page-sort/, locally as well, so the node imports them from one place.
 export interface NodeFiles {
     sortsDir: string;
     sortDataFile(communityAddress: string): string;
@@ -21,7 +23,9 @@ export function localNodeFiles(dataDir: string): NodeFiles {
     return {
         sortsDir: SORTS_DIR,
         sortDataFile: (address) => path.join(dataDir, "sort-data", `${address}.json`),
-        pushSorts: async () => {},
+        pushSorts: async () => {
+            await fs.cp(FLAIR_SORT_DIST, path.join(SORTS_DIR, FLAIR_SORT_SUBDIR), { recursive: true });
+        },
         pushSortData: async () => {}
     };
 }
@@ -46,7 +50,16 @@ export function remoteNodeFiles(sshHost: string, nodeDir: string): NodeFiles {
                 path.posix.join(nodeDir, "sort-data")
             ]);
             // -rlt, not -a: the files take the remote user as owner instead of a local uid
-            await run("rsync", ["-rlt", "--delete", "-e", SSH, `${SORTS_DIR}/`, `${sshHost}:${path.posix.join(nodeDir, "sorts")}/`]);
+            const sorts = path.posix.join(nodeDir, "sorts");
+            await run("rsync", ["-rlt", "--delete", "--exclude", FLAIR_SORT_SUBDIR, "-e", SSH, `${SORTS_DIR}/`, `${sshHost}:${sorts}/`]);
+            await run("rsync", [
+                "-rlt",
+                "--delete",
+                "-e",
+                SSH,
+                `${FLAIR_SORT_DIST}/`,
+                `${sshHost}:${path.posix.join(sorts, FLAIR_SORT_SUBDIR)}/`
+            ]);
         },
         async pushSortData(localFile, address) {
             await run("rsync", ["-rlt", "-e", SSH, localFile, `${sshHost}:${sortDataFile(address)}`]);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { REMOVAL_FLAIRS } from "../src/content.js";
 import { communityDescription, communityEdit, hostedAddresses, pageSettings, publishAndWait, PublishRejected } from "../src/pkc.js";
 
 const BOT = "12D3KooWBot";
@@ -8,7 +9,16 @@ const question = { name: "question", options: { answer: "secret" } };
 type Entry = ReturnType<typeof pageSettings>["posts"][number];
 const isFile = (entry: Entry): entry is Exclude<Entry, { name: string }> => "path" in entry;
 const files = (entries: Entry[]) => entries.filter(isFile);
-const named = (entries: Entry[]) => entries.map((e) => (isFile(e) ? [e.path.split("/").pop(), e.preloaded] : [e.name, "built-in"]));
+// A file entry by its basename, a flair filter page by its wire key, a built-in by name
+const named = (entries: Entry[]) =>
+    entries.map((e) =>
+        !isFile(e)
+            ? [e.name, "built-in"]
+            : e.path.endsWith("/flair-page-sort/index.js")
+              ? [`flair:${(e.options as Record<string, string>).sortName}`, e.preloaded]
+              : [e.path.split("/").pop(), e.preloaded]
+    );
+const FLAIRS = REMOVAL_FLAIRS.join(",");
 
 describe("communityEdit", () => {
     it("makes the bot a moderator, exempts it from every challenge and sets the sorts", () => {
@@ -50,15 +60,25 @@ describe("pageSettings", () => {
         const pages = pageSettings(FILE);
         expect(named(pages.posts)).toEqual([
             ["hot.js", true],
-            ["flaired.js", false],
+            ["flair:flaired", false],
             ["new.js", false],
             ["removed-first.js", false],
             ["active", "built-in"]
         ]);
         expect(named(pages.replies)).toEqual([
             ["mirrored-reddit-best.js", true],
-            ["flaired-replies.js", false]
+            ["flair:flaired", false]
         ]);
+        // The flair filter pages match the mirror's removal flairs, in the package's own option names
+        expect(files(pages.posts)[1].options).toEqual({ sortDataPath: FILE, flairs: FLAIRS, sortName: "flaired", order: "flaired" });
+        expect(files(pages.replies)[1].options).toEqual({
+            sortDataPath: FILE,
+            flairs: FLAIRS,
+            sortName: "flaired",
+            layout: "flat",
+            order: "best",
+            nativeWeight: "1"
+        });
         expect(
             files([...pages.posts, ...pages.replies]).every(
                 (p) => p.privateOptions.includes("sortDataPath") && p.options.sortDataPath === FILE
@@ -69,26 +89,33 @@ describe("pageSettings", () => {
     it("with hotSort removed-only serves the flaired filter as `hot`, busiest first, keeps the recent order under `flaired` and moves Reddit's hot order to its own name", () => {
         const pages = pageSettings(FILE, undefined, "removed-only");
         expect(named(pages.posts)).toEqual([
-            ["flaired-hot.js", true],
-            ["flaired.js", false],
+            ["flair:hot", true],
+            ["flair:flaired", false],
             ["mirrored-reddit-hot.js", false],
             ["new.js", false],
             ["removed-first.js", false],
             ["active", "built-in"]
         ]);
-        expect(files(pages.posts)[0].options).toEqual({ sortDataPath: FILE, order: "hot" });
-        expect(files(pages.posts)[1].options).toEqual({ sortDataPath: FILE, order: "flaired" });
+        expect(files(pages.posts)[0].options).toEqual({ sortDataPath: FILE, flairs: FLAIRS, sortName: "hot", order: "hot" });
+        expect(files(pages.posts)[1].options).toEqual({ sortDataPath: FILE, flairs: FLAIRS, sortName: "flaired", order: "flaired" });
         expect(communityEdit({ settings: { challenges: [] } }, BOT, FILE, undefined, "removed-only")?.settings?.pages).toEqual(pages);
     });
 
     it("with replySort removed-only preloads the flaired tree inside threads and keeps the other reply sorts under their names", () => {
         const pages = pageSettings(FILE, undefined, "removed-only", "removed-only");
         expect(named(pages.replies)).toEqual([
-            ["flaired-tree.js", true],
+            ["flair:flaired-tree", true],
             ["mirrored-reddit-best.js", false],
-            ["flaired-replies.js", false]
+            ["flair:flaired", false]
         ]);
-        expect(files(pages.replies)[0].options).toEqual({ sortDataPath: FILE, nativeWeight: "1" });
+        expect(files(pages.replies)[0].options).toEqual({
+            sortDataPath: FILE,
+            flairs: FLAIRS,
+            sortName: "flaired-tree",
+            layout: "tree",
+            order: "best",
+            nativeWeight: "1"
+        });
         expect(
             communityEdit({ settings: { challenges: [] } }, BOT, FILE, undefined, "removed-only", "removed-only")?.settings?.pages
         ).toEqual(pages);
@@ -101,11 +128,11 @@ describe("pageSettings on a remote node", () => {
         const pages = pageSettings("/root/subreddit-mirror/sort-data/c.json", "/root/subreddit-mirror/sorts");
         expect(files([...pages.posts, ...pages.replies]).map((p) => p.path)).toEqual([
             "/root/subreddit-mirror/sorts/hot.js",
-            "/root/subreddit-mirror/sorts/flaired.js",
+            "/root/subreddit-mirror/sorts/flair-page-sort/index.js",
             "/root/subreddit-mirror/sorts/new.js",
             "/root/subreddit-mirror/sorts/removed-first.js",
             "/root/subreddit-mirror/sorts/mirrored-reddit-best.js",
-            "/root/subreddit-mirror/sorts/flaired-replies.js"
+            "/root/subreddit-mirror/sorts/flair-page-sort/index.js"
         ]);
     });
 });

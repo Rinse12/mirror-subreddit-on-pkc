@@ -3,20 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import { validatePageSortFileFactory } from "@pkcprotocol/pkc-js/page-sorts";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_FLAIRS } from "../sorts/flair-filter.js";
-import flairedHot from "../sorts/flaired-hot.js";
-import flairedReplies from "../sorts/flaired-replies.js";
-import flairedTree from "../sorts/flaired-tree.js";
-import flaired from "../sorts/flaired.js";
 import hot from "../sorts/hot.js";
 import mirroredRedditBest from "../sorts/mirrored-reddit-best.js";
 import mirroredRedditHot from "../sorts/mirrored-reddit-hot.js";
 import redditNew from "../sorts/new.js";
 import removedFirst from "../sorts/removed-first.js";
 import { redditHot } from "../sorts/sort-data.js";
+import { REMOVAL_FLAIRS, statusFlair } from "../src/content.js";
+import flairPageSort, { FLAIRS_OPTION, validatePageSortSettings } from "@pkcprotocol/flair-page-sort";
 
 const NOW = 1793296000;
-const ALL = [hot, mirroredRedditHot, redditNew, removedFirst, flaired, flairedHot, mirroredRedditBest, flairedReplies, flairedTree];
+const ALL = [hot, mirroredRedditHot, redditNew, removedFirst, mirroredRedditBest];
 
 // Each test gets its own file: sort-data.js caches one map per path
 function sortDataFile(data: Record<string, unknown>) {
@@ -57,15 +54,8 @@ describe("page sort files", () => {
             "mirrored-reddit-hot",
             "new",
             "removed-first",
-            "flaired",
-            "hot",
-            "mirrored-reddit-best",
-            "flaired",
-            "flaired-tree"
+            "mirrored-reddit-best"
         ]);
-        expect(flairedReplies(settings(file) as never)).toMatchObject({ scope: "replies", flat: true });
-        expect(flairedTree(settings(file) as never)).toMatchObject({ scope: "replies", flat: false, requireReplies: true });
-        expect(flaired(settings(file) as never)).toMatchObject({ scope: "posts", requireReplies: true });
     });
 
     it("reject a missing data path or a non-numeric weight", () => {
@@ -121,149 +111,18 @@ describe("removed-first", () => {
     });
 });
 
-describe("flaired (posts)", () => {
-    const MODS = "Removed by mods on Reddit";
-    const reply = (cid: string, flairs?: string[]) => ({
-        comment: { timestamp: NOW },
-        commentUpdate: args(cid, NOW, 0, flairs).commentUpdate
-    });
-    const file = () =>
-        sortDataFile({
-            QmPost: { score: 10, createdUtc: NOW - 86400, status: "up", flairedAt: null },
-            QmGonePost: { score: 10, createdUtc: NOW - 3 * 86400, status: "removed", removedBy: "moderator", flairedAt: NOW - 2 * 86400 },
-            QmGoneReply: { score: 3, createdUtc: NOW - 7200, status: "removed", removedBy: "gone", flairedAt: NOW - 3600 },
-            QmOlderGoneReply: { score: 3, createdUtc: NOW - 7200, status: "removed", removedBy: "gone", flairedAt: NOW - 5 * 86400 }
-        });
-
-    it("declines posts that neither carry a flair nor have a flaired reply", () => {
-        const { score } = flaired(settings(file()) as never);
-        expect(score({ ...args("QmPost", NOW), replies: [reply("QmUp"), reply("QmOther", ["Something else"])] } as never)).toBeNull();
-        expect(score({ ...args("QmNative", NOW), replies: [] } as never)).toBeNull();
-    });
-
-    it("keeps flaired posts and posts with a flaired reply, most recently flaired first", () => {
-        const { score } = flaired(settings(file()) as never);
-        const s = (a: unknown) => score(a as never) as number;
-        // The reply's removal is the latest thing that happened to the thread
-        expect(s({ ...args("QmPost", NOW), replies: [reply("QmUp"), reply("QmGoneReply", ["Removed or deleted on Reddit"])] })).toBe(
-            NOW - 3600
+describe("the flair filter pages", () => {
+    it("are told every removal flair the mirror sets, and no other", () => {
+        const removed = (["moderator", "automod_filtered", "reddit", "anti_evil_ops", "gone", "unknown"] as const).map(
+            (removedBy) => statusFlair({ status: "removed", removedBy, kind: "comment" })!.text
         );
-        expect(s({ ...args("QmGonePost", NOW, 0, [MODS]), replies: [reply("QmOlderGoneReply", ["Removed on Reddit"])] })).toBe(
-            NOW - 2 * 86400
-        );
-        // A flaired native post has no sort data: its own time stands in
-        expect(s({ ...args("QmNative", NOW - 10, 0, [MODS]), replies: [] })).toBe(NOW - 10);
-    });
-
-    it("takes the flairs to match and the order from its options", () => {
-        const { score } = flaired(settings(file(), { flairs: "Removed by Reddit admins", order: "new" }) as never);
-        expect(
-            score({ ...args("QmGonePost", NOW, 0, [MODS]), options: { flairs: "Removed by Reddit admins" }, replies: [] } as never)
-        ).toBeNull();
-        expect(
-            score({
-                ...args("QmGonePost", NOW, 0, ["Removed by Reddit admins"]),
-                options: { flairs: "Removed by Reddit admins", order: "new" },
-                replies: []
-            } as never)
-        ).toBe(NOW - 3 * 86400);
-        // Only a mod flair counts; the defaults leave author deletions and locks out
-        expect(DEFAULT_FLAIRS).not.toContain("Deleted by author on Reddit");
-        expect(score({ ...args("QmPost", NOW, 0, ["Deleted by author on Reddit"]), replies: [] } as never)).toBeNull();
-    });
-
-    it("with order hot ranks by the number of replies present, most recently removed first among equals", () => {
-        const { score } = flaired(settings(file(), { order: "hot" }) as never);
-        const options = { order: "hot" };
-        const removed = reply("QmGoneReply", ["Removed or deleted on Reddit"]);
-        const present = (n: number) => Array.from({ length: n }, (_, i) => reply(`QmUp${i}`));
-        const s = (replies: unknown[], flairs?: string[]) =>
-            score({ ...args("QmPost", NOW, 0, flairs), options, replies } as never) as number;
-        // Replies the community removed, their author deleted or that await approval don't count
-        const absent = [
-            { comment: { timestamp: NOW }, commentUpdate: { cid: "QmR", removed: true } },
-            { comment: { timestamp: NOW }, commentUpdate: { cid: "QmD", edit: { deleted: true } } },
-            { comment: { timestamp: NOW }, commentUpdate: { cid: "QmP", pendingApproval: true } }
-        ];
-        expect(s([removed, ...present(9), ...absent])).toBeCloseTo(10 + (NOW - 3600) / 1e10, 6);
-        // A thread removed-in days earlier wins on replies alone; among equals the latest removal comes first
-        const older = score({ ...args("QmGonePost", NOW, 0, [MODS]), options, replies: present(11) } as never) as number;
-        expect(older).toBeGreaterThan(s([removed, ...present(9)]));
-        const olderTie = score({ ...args("QmGonePost", NOW, 0, [MODS]), options, replies: present(10) } as never) as number;
-        expect(olderTie).toBeLessThan(s([removed, ...present(9)]));
-        expect(olderTie).toBeGreaterThan(9);
-        // Votes play no part
-        expect(score({ ...args("QmPost", NOW, 500), options, replies: [removed] } as never)).toBe(s([removed]));
-        // Still a filter: nothing flaired, nothing shown
-        expect(s(present(500))).toBeNull();
-        // A flaired native post without sort data counts its replies too, ranked by its own time among equals
-        expect(score({ ...args("QmNative", NOW - 10, 0, [MODS]), options, replies: present(3) } as never)).toBeCloseTo(
-            3 + (NOW - 10) / 1e10,
-            6
-        );
-    });
-
-    it("is also published as hot, and rejects a bad order or an empty flair list", () => {
-        const sort = flairedHot(settings(file()) as never);
-        expect(sort.sortName).toBe("hot");
-        expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: { order: "busiest" } } } as never)).toThrow(/order/);
-        expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: { order: "hot" } } } as never)).not.toThrow();
-        expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: { flairs: " , " } } } as never)).toThrow(/flairs/);
-        // No sort data at all is fine: a community that isn't a mirror can still filter by flair
-        expect(() => sort.validatePageSortSettings!({ pageSortSettings: { options: {} } } as never)).not.toThrow();
-    });
-});
-
-describe("flaired (replies)", () => {
-    it("declines replies without one of the flairs and ranks the rest like mirrored-reddit-best", () => {
-        const file = sortDataFile({
-            QmA: { score: 10, createdUtc: NOW - 100, status: "removed", removedBy: "removed", flairedAt: NOW },
-            QmB: { score: 10, createdUtc: NOW - 50, status: "removed", removedBy: "removed", flairedAt: NOW },
-            QmUp: { score: 100, createdUtc: NOW - 50, status: "up", flairedAt: null }
-        });
-        const { score } = flairedReplies(settings(file) as never);
-        const best = mirroredRedditBest(settings(file) as never).score;
-        expect(score(args("QmUp", NOW) as never)).toBeNull();
-        expect(score(args("QmA", NOW, 0, ["Removed on Reddit"]) as never)).toBe(best(args("QmA", NOW) as never));
-        expect(score(args("QmA", NOW, 0, ["Removed on Reddit"]) as never) as number).toBeGreaterThan(
-            score(args("QmB", NOW, 0, ["Removed on Reddit"]) as never) as number
-        );
-        expect(score(args("QmNative", NOW, 2, ["Removed by mods on Reddit"]) as never) as number).toBeCloseTo(2 - NOW / 1e10);
-    });
-});
-
-describe("flaired-tree (replies)", () => {
-    const reply = (cid: string, flairs?: string[]) => ({
-        comment: { timestamp: NOW },
-        commentUpdate: { cid, ...(flairs ? { flairs: flairs.map((text) => ({ text })) } : {}) }
-    });
-
-    it("keeps a reply that carries a flair or has a flaired reply anywhere under it, declines the rest, in mirrored-reddit-best order", () => {
-        const file = sortDataFile({
-            QmA: { score: 10, createdUtc: NOW - 100, status: "up", flairedAt: null },
-            QmB: { score: 50, createdUtc: NOW - 50, status: "up", flairedAt: null },
-            QmGone: { score: 1, createdUtc: NOW - 20, status: "removed", removedBy: "removed", flairedAt: NOW }
-        });
-        const { score } = flairedTree(settings(file) as never);
-        const best = mirroredRedditBest(settings(file) as never).score;
-        // Its own flair
-        expect(score({ ...args("QmGone", NOW, 0, ["Removed on Reddit"]), replies: [] } as never)).toBe(best(args("QmGone", NOW) as never));
-        // A flaired reply deep under it: the chain above a removed reply stays
-        expect(score({ ...args("QmA", NOW), replies: [reply("QmMid"), reply("QmGone", ["Removed by mods on Reddit"])] } as never)).toBe(
-            best(args("QmA", NOW) as never)
-        );
-        // Nothing flaired on it or under it
-        expect(score({ ...args("QmB", NOW), replies: [reply("QmMid"), reply("QmOther", ["Something else"])] } as never)).toBeNull();
-        expect(score({ ...args("QmB", NOW), replies: [] } as never)).toBeNull();
-        // Author deletions don't count by default; the flairs option decides
-        expect(score({ ...args("QmB", NOW), replies: [reply("QmDel", ["Deleted by author on Reddit"])] } as never)).toBeNull();
-        expect(
-            score({
-                ...args("QmB", NOW),
-                options: { nativeWeight: "1", flairs: "Deleted by author on Reddit" },
-                replies: [reply("QmDel", ["Deleted by author on Reddit"])]
-            } as never)
-        ).toBe(best(args("QmB", NOW) as never));
+        expect(new Set(removed)).toEqual(new Set(REMOVAL_FLAIRS));
+        expect(REMOVAL_FLAIRS).not.toContain(statusFlair({ status: "deleted", removedBy: null, kind: "comment" })!.text);
+        expect(REMOVAL_FLAIRS).not.toContain(statusFlair({ status: "locked", removedBy: null, kind: "post" })!.text);
+        // The package takes the list as its flairs option
+        const options = { [FLAIRS_OPTION]: REMOVAL_FLAIRS.join(","), sortDataPath: sortDataFile({}) };
+        expect(() => validatePageSortSettings({ pageSortSettings: { name: "x", options } })).not.toThrow();
+        expect(flairPageSort({ pageSortSettings: { name: "x", options: { ...options, sortName: "hot" } } }).sortName).toBe("hot");
     });
 });
 

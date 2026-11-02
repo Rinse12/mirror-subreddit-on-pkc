@@ -1,7 +1,9 @@
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { REMOVAL_FLAIRS } from "./content.js";
 import PKC from "@pkcprotocol/pkc-js";
 import type { MirrorConfig } from "./config.js";
 
@@ -10,6 +12,12 @@ export type BotSigner = Awaited<ReturnType<PkcInstance["createSigner"]>>;
 
 const PUBLISH_TIMEOUT_MS = 5 * 60_000;
 export const SORTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../sorts");
+// The flair filter pages come from @pkcprotocol/flair-page-sort: its dist/ is copied under sortsDir on the node
+export const FLAIR_SORT_DIST = path.join(
+    path.dirname(createRequire(import.meta.url).resolve("@pkcprotocol/flair-page-sort/package.json")),
+    "dist"
+);
+export const FLAIR_SORT_SUBDIR = "flair-page-sort";
 
 // pkc-js's error once the RPC server went away under a running client (the node's bitsocial service restarted, the
 // tunnel still up): the client never reconnects, so every call fails with it from then on
@@ -153,6 +161,15 @@ export interface CommunityState {
     settings?: { challenges?: ChallengeSetting[]; pages?: unknown; [key: string]: unknown };
 }
 
+// One page of the flair filter (@pkcprotocol/flair-page-sort, listed once per page): the mirror's removal flairs, the wire
+// key, order and layout per page, the data file for the flaired and best orders
+const flairEntry = (sortsDir: string, sortDataFile: string, preloaded: boolean, page: Record<string, string>) => ({
+    path: path.posix.join(sortsDir, FLAIR_SORT_SUBDIR, "index.js"),
+    options: { sortDataPath: sortDataFile, flairs: REMOVAL_FLAIRS.join(","), ...page },
+    privateOptions: ["sortDataPath"],
+    preloaded
+});
+
 const sortEntry = (sortsDir: string, file: string, sortDataFile: string, preloaded: boolean, extra: Record<string, string> = {}) => ({
     // A path on the machine running the community, which import()s it
     path: path.posix.join(sortsDir, file),
@@ -178,29 +195,28 @@ export function pageSettings(
     hotSort: HotSort = "reddit-hot",
     replySort: ReplySort = "reddit-best"
 ) {
-    const flairedOptions = { order: "flaired" };
+    const flaired = flairEntry(sortsDir, sortDataFile, false, { sortName: "flaired", order: "flaired" });
     const weight = { nativeWeight: "1" };
     return {
         posts: [
             ...(hotSort === "removed-only"
                 ? [
-                      sortEntry(sortsDir, "flaired-hot.js", sortDataFile, true, { order: "hot" }),
-                      sortEntry(sortsDir, "flaired.js", sortDataFile, false, flairedOptions),
-                      sortEntry(sortsDir, "mirrored-reddit-hot.js", sortDataFile, false, { nativeWeight: "1" })
+                      flairEntry(sortsDir, sortDataFile, true, { sortName: "hot", order: "hot" }),
+                      flaired,
+                      sortEntry(sortsDir, "mirrored-reddit-hot.js", sortDataFile, false, weight)
                   ]
-                : [
-                      sortEntry(sortsDir, "hot.js", sortDataFile, true, { nativeWeight: "1" }),
-                      sortEntry(sortsDir, "flaired.js", sortDataFile, false, flairedOptions)
-                  ]),
+                : [sortEntry(sortsDir, "hot.js", sortDataFile, true, weight), flaired]),
             sortEntry(sortsDir, "new.js", sortDataFile, false),
             sortEntry(sortsDir, "removed-first.js", sortDataFile, false, { nativeWeight: "1" }),
             // pkc-js's own active: bumps on native replies, so Seedit's "active" tab isn't empty
             { name: "active" }
         ],
         replies: [
-            ...(replySort === "removed-only" ? [sortEntry(sortsDir, "flaired-tree.js", sortDataFile, true, weight)] : []),
+            ...(replySort === "removed-only"
+                ? [flairEntry(sortsDir, sortDataFile, true, { sortName: "flaired-tree", layout: "tree", order: "best", ...weight })]
+                : []),
             sortEntry(sortsDir, "mirrored-reddit-best.js", sortDataFile, replySort !== "removed-only", weight),
-            sortEntry(sortsDir, "flaired-replies.js", sortDataFile, false, weight)
+            flairEntry(sortsDir, sortDataFile, false, { sortName: "flaired", layout: "flat", order: "best", ...weight })
         ]
     };
 }
