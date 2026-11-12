@@ -19,7 +19,7 @@
     },
     "dependencies": {
         "@pkcprotocol/flair-page-sort": "file:../flair-page-sort",
-        "@pkcprotocol/pkc-js": "0.0.131",
+        "@pkcprotocol/pkc-js": "0.0.142",
         "better-sqlite3": "12.9.0",
         "cheerio": "1.2.0",
         "tsx": "4.23.15",
